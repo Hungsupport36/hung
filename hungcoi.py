@@ -332,6 +332,65 @@ def _creative_db_init():
             ON creative_accounts(provider,status,cooldown_until);
         """)
 
+def _creative_activate_verified_flow_account(account_id=None, profile_path=None, worker_id=None):
+    """Mark a real, successfully verified Flow profile ACTIVE."""
+    try:
+        _creative_db_init()
+        now = _creative_now()
+        with _batch_db() as db:
+            aid = str(account_id or "").strip()
+            profile = str(profile_path or "").strip()
+            if not aid and profile:
+                row = db.execute(
+                    "SELECT account_id FROM creative_accounts "
+                    "WHERE session_profile=? LIMIT 1",
+                    (profile,),
+                ).fetchone()
+                aid = str(row[0]) if row else ""
+            if not aid and profile:
+                aid = Path(profile).name
+            if not aid:
+                return False
+            row = db.execute(
+                "SELECT account_id FROM creative_accounts "
+                "WHERE account_id=? OR session_profile=? LIMIT 1",
+                (aid, profile),
+            ).fetchone()
+            if not row:
+                return False
+            aid = str(row[0])
+            db.execute(
+                "UPDATE creative_accounts SET "
+                "status='ACTIVE', last_error=NULL, cooldown_until=NULL, "
+                "last_success=?, updated_at=? WHERE account_id=?",
+                (now, now, aid),
+            )
+            if worker_id:
+                db.execute(
+                    "UPDATE creative_workers SET account_id=?, "
+                    "updated_at=? WHERE worker_id=?",
+                    (aid, now, str(worker_id)),
+                )
+        workflow_cmd_log(
+            "FLOW",
+            "PROFILE_VERIFIED_ACTIVE",
+            account_id=aid,
+            profile=profile,
+            worker_id=str(worker_id or ""),
+        )
+        return True
+    except Exception as exc:
+        try:
+            workflow_cmd_log(
+                "FLOW",
+                "PROFILE_ACTIVE_UPDATE_FAILED",
+                error=str(exc)[:500],
+                account_id=str(account_id or ""),
+            )
+        except Exception:
+            pass
+        return False
+
 def _creative_create_jobs(project, scenes, requested_engine=CREATIVE_ENGINE_AUTO):
     _creative_db_init()
     project = _batch_project_name(project)
@@ -15105,7 +15164,7 @@ def _creative_flow_manual_profile_open(profile_path=""):
     except Exception as exc:
         return _creative_account_pool_html(), f"🔴 Không mở được Profile: {str(exc)[:1000]}", ""
 
-async def _creative_flow_manual_profile_verify_async(account_id):
+async def _creative_flow_manual_profile_verify_async_impl(account_id):
     """VERIFY Flow bằng Playwright ASYNC API, tuyệt đối không dùng Sync API trong callback."""
     aid = str(account_id or "").strip()
     if not aid:
@@ -15247,10 +15306,94 @@ async def _creative_flow_manual_profile_verify_async(account_id):
         _creative_set_account_state(aid, "AUTH_ERROR", detail)
         return _creative_account_pool_html(), f"🔴 VERIFY PROFILE lỗi {aid}: {detail[:1000]}"
 
+async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
+    _result = await _creative_flow_manual_profile_verify_async_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_async_impl(*args, **kwargs)
+    try:
+        import inspect as _inspect
+        _sig = _inspect.signature(_creative_flow_manual_profile_verify_async_impl)
+        _bound = _sig.bind_partial(*args, **kwargs)
+        _account_id = (
+            _bound.arguments.get("account_id")
+            or _bound.arguments.get("account")
+            or _bound.arguments.get("account_name")
+        )
+        _profile = (
+            _bound.arguments.get("profile")
+            or _bound.arguments.get("profile_path")
+            or _bound.arguments.get("session_profile")
+        )
+        _worker = _bound.arguments.get("worker_id")
+        _ok = bool(_result)
+        if isinstance(_result, dict):
+            _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
+            _account_id = _account_id or _result.get("account_id")
+            _profile = _profile or _result.get("profile_path")
+            _worker = _worker or _result.get("worker_id")
+        elif isinstance(_result, (tuple, list)):
+            _ok = bool(_result[0]) if _result else False
+        if _ok:
+            _creative_activate_verified_flow_account(
+                account_id=_account_id,
+                profile_path=_profile,
+                worker_id=_worker,
+            )
+    except Exception as _exc:
+        try:
+            workflow_cmd_log(
+                "FLOW",
+                "PROFILE_VERIFY_WRAPPER_ERROR",
+                error=str(_exc)[:500],
+            )
+        except Exception:
+            pass
+    return _result
 
-async def _creative_flow_manual_profile_verify(account_id):
+
+async def _creative_flow_manual_profile_verify_impl(account_id):
     """UI callback; VERIFY itself uses Playwright Async API only."""
     return await _creative_flow_manual_profile_verify_async(account_id)
+
+async def _creative_flow_manual_profile_verify(*args, **kwargs):
+    _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_impl(*args, **kwargs)
+    try:
+        import inspect as _inspect
+        _sig = _inspect.signature(_creative_flow_manual_profile_verify_impl)
+        _bound = _sig.bind_partial(*args, **kwargs)
+        _account_id = (
+            _bound.arguments.get("account_id")
+            or _bound.arguments.get("account")
+            or _bound.arguments.get("account_name")
+        )
+        _profile = (
+            _bound.arguments.get("profile")
+            or _bound.arguments.get("profile_path")
+            or _bound.arguments.get("session_profile")
+        )
+        _worker = _bound.arguments.get("worker_id")
+        _ok = bool(_result)
+        if isinstance(_result, dict):
+            _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
+            _account_id = _account_id or _result.get("account_id")
+            _profile = _profile or _result.get("profile_path")
+            _worker = _worker or _result.get("worker_id")
+        elif isinstance(_result, (tuple, list)):
+            _ok = bool(_result[0]) if _result else False
+        if _ok:
+            _creative_activate_verified_flow_account(
+                account_id=_account_id,
+                profile_path=_profile,
+                worker_id=_worker,
+            )
+    except Exception as _exc:
+        try:
+            workflow_cmd_log(
+                "FLOW",
+                "PROFILE_VERIFY_WRAPPER_ERROR",
+                error=str(_exc)[:500],
+            )
+        except Exception:
+            pass
+    return _result
 
 def _creative_account_pool_html(limit=100):
     """Render account pool with local profile/identity state."""
