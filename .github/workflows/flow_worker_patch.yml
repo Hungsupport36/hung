@@ -24,6 +24,7 @@ jobs:
           from pathlib import Path
           import ast
           import textwrap
+          import re
 
           p = Path("hungcoi.py")
           s = p.read_text(encoding="utf-8")
@@ -169,7 +170,7 @@ jobs:
               lines[end:end] = ["\n"] + wrapper_lines
 
           s = "".join(lines)
-          ast.parse(s, filename="hungcoi.py")
+          # Patch the health-failure demotion in _creative_claim_account_checked_v1161.\n          # The source is large, so patch the stable two-line marker instead of replacing the file.\n          if "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY" not in s:\n              marker = "        detail = str(detail or \\\"\\\")\\n        now = _creative_now()"\n              guard = textwrap.dedent(r'''\n              detail = str(detail or "")\n              now = _creative_now()\n              try:\n                  with _batch_db() as db:\n                      _verified_row = db.execute(\n                          "SELECT last_success FROM creative_accounts WHERE account_id=? LIMIT 1",\n                          (account_id,),\n                      ).fetchone()\n                  _verified_at = str(_verified_row[0] or "") if _verified_row else ""\n                  if _verified_at:\n                      _dt = datetime.fromisoformat(_verified_at.replace("Z", "+00:00"))\n                      _age = (datetime.now(timezone.utc) - _dt).total_seconds()\n                      if 0 <= _age <= 900:\n                          workflow_cmd_log(\n                              "FLOW",\n                              "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY",\n                              account_id=account_id,\n                              age_seconds=round(_age, 1),\n                              detail=detail[:500],\n                              level="DEBUG",\n                          )\n                          return account_id, "OK"\n              except Exception:\n                  pass\n              ''').strip("\\n")\n              if marker not in s:\n                  raise SystemExit("V11.6.3 health-failure marker not found")\n              s = s.replace(marker, guard, 1)\n\n          ast.parse(s, filename="hungcoi.py")
           p.write_text(s, encoding="utf-8")
           print("V11.6.2 verified-profile activation patch syntax OK")
 
@@ -185,3 +186,4 @@ jobs:
           fi
           git commit -m "V11.6.2: activate verified Flow profiles"
           git push origin HEAD:fix/creative-studio-v7
+
