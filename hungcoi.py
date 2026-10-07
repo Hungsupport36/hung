@@ -7007,6 +7007,7 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                 })
             config = types.GenerateContentConfig(**config_kwargs)
             _channel_search_needed = bool(youtube_channel_urls and not discovered_channel_video_urls)
+            competitor_tool_fallback = False
             if url_context_urls or _channel_search_needed:
                 # Non-YouTube web URLs use URL Context. If explicit channel discovery
                 # failed, allow the main B1 request one final Google Search attempt.
@@ -7052,22 +7053,26 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                         pct=68,
                     )
                 except Exception as tool_exc:
-                    workflow_cmd_log(
-                        'GEMINI', 'COMPETITOR_TOOLS_REQUEST_FAIL', project=project or '',
-                        key_index=index + 1,
-                        url_context_count=len(url_context_urls),
-                        youtube_channel_search_count=int(_channel_search_needed),
-                        error=str(tool_exc)[:1200], level='ERROR', pct=0,
-                    )
-                    # Mark this as a key/transport-rotatable failure. With multiple
-                    # keys, immediately move to the next key instead of retrying the
-                    # same broken URL Context path. With one key, fail fast and tell
-                    # the user exactly which capability failed.
-                    raise _GeminiExplicitResponseError(
-                        'Gemini không truy xuất được công cụ nguồn đối thủ; không được giả định đã đọc URL. '
-                        f'Underlying tool error: {str(tool_exc)[:900]}',
-                        retryable=True, mode=response_mode or ''
-                    ) from tool_exc
+                    tool_error_text = str(tool_exc)[:1600]
+                    workflow_cmd_log('GEMINI','COMPETITOR_TOOLS_REQUEST_FAIL',project=project or '',
+                                     key_index=index + 1,url_context_count=len(url_context_urls),
+                                     youtube_channel_search_count=int(_channel_search_needed),
+                                     error=tool_error_text,level='ERROR',pct=0)
+                    if '429' in tool_error_text or 'resource_exhausted' in tool_error_text.lower() or 'quota' in tool_error_text.lower():
+                        competitor_tool_fallback = True
+                        fallback_prompt = effective_prompt + "\n\nCOMPETITOR SOURCE TOOL FALLBACK — the Gemini server-side competitor retrieval tool returned RESOURCE_EXHAUSTED/429. Do NOT claim that the supplied competitor URL was inspected. Use only the script/domain/reference material actually available in this request. Set competitor_style_confirmed=false, competitor_style_fallback=true, and competitor_evidence to a short factual statement that the source could not be retrieved. The workflow may continue using a documented project-style fallback."
+                        fallback_contents=list(contents)
+                        if fallback_contents: fallback_contents[-1]=fallback_prompt
+                        fallback_config=types.GenerateContentConfig(**config_kwargs)
+                        workflow_cmd_log('GEMINI','COMPETITOR_TOOL_FALLBACK_TEXT_ONLY',project=project or '',key_index=index + 1,reason='429 RESOURCE_EXHAUSTED',level='WARN',pct=35)
+                        result=client.models.generate_content(model=GEMINI_MODEL,contents=fallback_contents,config=fallback_config)
+                        workflow_cmd_log('GEMINI','COMPETITOR_TOOL_FALLBACK_OK',project=project or '',key_index=index + 1,note='B1 tiếp tục không dùng competitor server-side tool; không giả định đã đọc URL.',pct=68)
+                    else:
+                        raise _GeminiExplicitResponseError(
+                            'Gemini không truy xuất được công cụ nguồn đối thủ; không được giả định đã đọc URL. '
+                            f'Underlying tool error: {tool_error_text[:900]}',
+                            retryable=True, mode=response_mode or ''
+                        ) from tool_exc
             else:
                 safe_config = config
                 workflow_cmd_log("GEMINI", "API_CALL_ENTER", project=project or "", key_index=index + 1, model=GEMINI_MODEL, response_mode=response_mode or "", pct=32)
@@ -7120,6 +7125,10 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                     pct=72,
                 )
                 if isinstance(parsed_response, dict):
+                    if str(response_mode or '').strip().lower() == 'topic_style' and competitor_tool_fallback:
+                        parsed_response['competitor_style_confirmed']=False
+                        parsed_response['competitor_style_fallback']=True
+                        parsed_response['competitor_evidence']='Nguồn đối thủ không thể truy xuất qua công cụ Gemini server-side (429 RESOURCE_EXHAUSTED); không dùng nguồn đó để xác nhận Style.'
                     if str(response_mode or '').strip().lower() == 'topic_style':
                         _GEMINI_LAST_STRUCTURED_RESULT = {'topic_style': parsed_response}
                     else:
@@ -7366,6 +7375,9 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                     _GEMINI_KEY_INDEX=nxt_index
                     _GEMINI_KEY_CURSOR.index=nxt_index
                 continue
+            if rotatable and len(keys) == 1:
+                workflow_cmd_log('GEMINI','GEMINI QUOTA_OR_KEY_EXHAUSTED',project=project or '',key_index=index + 1,error=str(exc)[:1200],level='ERROR',pct=0)
+                raise
             if can_retry and (transient or isinstance(exc, _GeminiExplicitResponseError)):
                 workflow_cmd_log(
                     'GEMINI', 'API_RETRY_SAME_KEY', project=project or '',
