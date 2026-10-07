@@ -14484,8 +14484,7 @@ def _creative_flow_account_open(account_id):
         _CREATIVE_FLOW_ADAPTER._context(aid)
         workflow_cmd_log("FLOW_POOL", "SESSION_OPEN_OR_REOPEN", account_id=aid, profile=profile)
         return _creative_account_pool_html(), (
-            f"🟡 Đã mở/re-open session {aid} · dùng đúng Profile cũ.
-"
+            f"🟡 Đã mở/re-open session {aid} · dùng đúng Profile cũ.\n"
             "Đăng nhập Google/Flow hoặc xử lý CAPTCHA thủ công, sau đó bấm VERIFY Account."
         )
     except Exception as exc:
