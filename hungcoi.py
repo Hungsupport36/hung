@@ -14615,16 +14615,27 @@ def _flow_create_manual_profile(profile_path=""):
     return aid, str(p)
 
 def _creative_flow_manual_profile_open(profile_path=""):
-    """Open a new profile, then let the user log into Google/Flow manually."""
+    """Register a profile immediately; open Chrome in a background worker."""
     try:
+        ok, detail = _playwright_chrome_runtime_check()
+        if not ok:
+            return _creative_account_pool_html(), detail, ""
         aid, profile = _flow_create_manual_profile(profile_path)
-        global _CREATIVE_FLOW_ADAPTER
-        if _CREATIVE_FLOW_ADAPTER is None:
-            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
-        _CREATIVE_FLOW_ADAPTER._context(aid)
+        def _open_worker():
+            try:
+                global _CREATIVE_FLOW_ADAPTER
+                if _CREATIVE_FLOW_ADAPTER is None:
+                    _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+                _CREATIVE_FLOW_ADAPTER._context(aid)
+                workflow_cmd_log("FLOW_POOL", "PROFILE_BROWSER_READY", account_id=aid, profile=profile)
+            except Exception as exc:
+                _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
+                workflow_cmd_log("FLOW_POOL", "PROFILE_BROWSER_ERROR", account_id=aid, detail=str(exc)[:1000], level="ERROR")
+        threading.Thread(target=_open_worker, name=f"VHUNG-FlowProfile-{aid}", daemon=True).start()
         return _creative_account_pool_html(), (
-            f"🟡 Đã mở {aid} · Profile: {profile}\n\n"
-            "👉 Tự đăng nhập Google/Flow trên cửa sổ vừa mở. Đăng nhập xong bấm VERIFY PROFILE."
+            f"🟡 Đã tạo {aid} · Profile: {profile}\n\n"
+            "⏳ Chrome đang mở ở nền, giao diện không bị khóa. "
+            "Khi cửa sổ Chrome hiện ra → tự đăng nhập Google/Flow → bấm VERIFY PROFILE."
         ), aid
     except Exception as exc:
         return _creative_account_pool_html(), f"🔴 Không mở được Profile: {str(exc)[:1000]}", ""
@@ -14704,6 +14715,113 @@ def _creative_account_pool_html(limit=100):
     parts.append("</div>")
     return "".join(parts)
 
+
+# ============================================================
+# PLAYWRIGHT / GOOGLE CHROME RUNTIME V11
+# ============================================================
+# Flow uses the user's installed stable Chrome. We deliberately do NOT install
+# or launch Playwright's bundled Chromium ("Chrome for Testing").
+# Package installation is explicit and runs in a background thread so Gradio
+# never freezes while pip is working.
+
+_PLAYWRIGHT_INSTALL_LOCK = threading.RLock()
+_PLAYWRIGHT_INSTALL_RUNNING = False
+_PLAYWRIGHT_INSTALL_MESSAGE = "⚪ Chưa kiểm tra Playwright / Google Chrome."
+
+def _playwright_chrome_runtime_check():
+    """Return (ok, detail) without launching a browser."""
+    try:
+        import importlib.util
+        if importlib.util.find_spec("playwright") is None:
+            return False, "🔴 Thiếu Python package Playwright. Bấm CÀI / SỬA PLAYWRIGHT."
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        try:
+            chrome_candidates = []
+            for env_key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
+                base = os.environ.get(env_key)
+                if base:
+                    chrome_candidates.extend([
+                        Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                        Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe",
+                    ])
+            chrome = next((p for p in chrome_candidates if p.exists()), None)
+            if chrome is None:
+                # Playwright can resolve the stable Chrome channel itself.
+                # The executable-path probe is intentionally not used here because
+                # it may point at bundled Chromium instead of installed Chrome.
+                try:
+                    probe = pw.chromium.executable_path
+                    bundled = str(probe).lower()
+                    if "chrome-win" in bundled or "chrome for testing" in bundled:
+                        pass
+                except Exception:
+                    pass
+                return False, "🔴 Không tìm thấy Google Chrome Stable. Tool KHÔNG tự cài Chrome Testing."
+            return True, f"🟢 Playwright OK · Google Chrome Stable OK · {chrome}"
+        finally:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+    except Exception as exc:
+        return False, f"🔴 Playwright runtime lỗi: {str(exc)[:700]}"
+
+def _playwright_install_worker():
+    global _PLAYWRIGHT_INSTALL_RUNNING, _PLAYWRIGHT_INSTALL_MESSAGE
+    with _PLAYWRIGHT_INSTALL_LOCK:
+        if _PLAYWRIGHT_INSTALL_RUNNING:
+            return
+        _PLAYWRIGHT_INSTALL_RUNNING = True
+        _PLAYWRIGHT_INSTALL_MESSAGE = "🟡 Đang cài/sửa Python Playwright ở nền..."
+    try:
+        workflow_cmd_log("PLAYWRIGHT", "INSTALL_START")
+        proc = subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "playwright"],
+            capture_output=True, text=True, timeout=900,
+            creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+        )
+        if proc.returncode != 0:
+            msg = (proc.stderr or proc.stdout or "pip install failed")[-1800:]
+            _PLAYWRIGHT_INSTALL_MESSAGE = f"🔴 Cài Playwright thất bại: {msg}"
+            workflow_cmd_log("PLAYWRIGHT", "INSTALL_FAILED", detail=msg, level="ERROR")
+            return
+        ok, detail = _playwright_chrome_runtime_check()
+        if not ok:
+            _PLAYWRIGHT_INSTALL_MESSAGE = (
+                "🟠 Đã cài Python Playwright nhưng Chrome Stable chưa sẵn sàng. "
+                "Tool KHÔNG cài Chromium/Chrome Testing.\n\n" + detail
+            )
+            workflow_cmd_log("PLAYWRIGHT", "PACKAGE_READY_BROWSER_MISSING", detail=detail, level="WARN")
+        else:
+            _PLAYWRIGHT_INSTALL_MESSAGE = detail
+            workflow_cmd_log("PLAYWRIGHT", "READY", detail=detail)
+    except Exception as exc:
+        _PLAYWRIGHT_INSTALL_MESSAGE = f"🔴 Lỗi cài Playwright: {str(exc)[:1200]}"
+        workflow_cmd_log("PLAYWRIGHT", "INSTALL_EXCEPTION", detail=str(exc)[:1200], level="ERROR")
+    finally:
+        with _PLAYWRIGHT_INSTALL_LOCK:
+            _PLAYWRIGHT_INSTALL_RUNNING = False
+
+def _playwright_install_ui():
+    global _PLAYWRIGHT_INSTALL_RUNNING
+    with _PLAYWRIGHT_INSTALL_LOCK:
+        if _PLAYWRIGHT_INSTALL_RUNNING:
+            return "🟡 Playwright đang được cài/sửa ở nền — giao diện không bị khóa."
+        _PLAYWRIGHT_INSTALL_RUNNING = True
+    threading.Thread(
+        target=_playwright_install_worker,
+        name="VHUNG-Playwright-Installer",
+        daemon=True,
+    ).start()
+    return "🟡 Đã bắt đầu cài/sửa Playwright ở nền. Bấm KIỂM TRA RUNTIME sau khi xong."
+
+def _playwright_runtime_ui():
+    if _PLAYWRIGHT_INSTALL_RUNNING:
+        return "🟡 Playwright installer đang chạy ở nền..."
+    ok, detail = _playwright_chrome_runtime_check()
+    return detail
+
 _V9_FLOW_CONTEXT = GoogleFlowAdapter._context
 def _flow_context_registered_profile(self, account_id):
     row = _creative_get_account(account_id)
@@ -14718,11 +14836,22 @@ def _flow_context_registered_profile(self, account_id):
                 return item
     except Exception:
         pass
+    # IMPORTANT: use the user's installed stable Google Chrome, NOT Playwright's
+    # "Chrome for Testing" / bundled Chromium. This keeps Flow sessions in a
+    # normal browser runtime while the persistent profile remains tool-owned.
+    ok, detail = _playwright_chrome_runtime_check()
+    if not ok:
+        raise RuntimeError(detail)
     from playwright.sync_api import sync_playwright
     p = Path(profile).expanduser().resolve()
     p.mkdir(parents=True, exist_ok=True)
     pw = sync_playwright().start()
-    browser = pw.chromium.launch_persistent_context(str(p), headless=False)
+    browser = pw.chromium.launch_persistent_context(
+        str(p),
+        headless=False,
+        channel="chrome",
+        args=["--disable-background-networking"],
+    )
     page = browser.pages[0] if browser.pages else browser.new_page()
     page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
     self._contexts[account_id] = (pw, browser, page)
@@ -16294,6 +16423,20 @@ def launch_ui():
                 image_engine_check.click(
                     _wrap_gradio_callback(_check_image_engine_ui),
                     image_engine, image_engine_status, show_progress="minimal"
+                )
+
+                gr.Markdown("### 🧩 Playwright Runtime — Google Chrome Stable")
+                with gr.Row():
+                    playwright_check_btn = gr.Button("🔌 KIỂM TRA RUNTIME")
+                    playwright_install_btn = gr.Button("🛠 CÀI / SỬA PLAYWRIGHT", variant="primary")
+                playwright_status = gr.Markdown(_playwright_runtime_ui())
+                playwright_check_btn.click(
+                    _wrap_gradio_callback(_playwright_runtime_ui),
+                    None, playwright_status, show_progress="hidden"
+                )
+                playwright_install_btn.click(
+                    _wrap_gradio_callback(_playwright_install_ui),
+                    None, playwright_status, show_progress="hidden"
                 )
 
                 gr.Markdown("### 👥 Google Flow Account Pool — đăng nhập Profile thủ công")
