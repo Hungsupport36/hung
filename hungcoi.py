@@ -19711,7 +19711,69 @@ def _flow_thread_context(self, account_id):
 
 GoogleFlowAdapter._context = _flow_thread_context
 
+def _flow_create_project(page, timeout=45):
+    """Mirror the old Creative Studio browser sequence: open/create a Flow project before prompt entry."""
+    deadline = time.monotonic() + max(10, int(timeout))
+    # If the prompt composer is already visible, we are already inside a project.
+    selectors = ["textarea", "[contenteditable='true']", "[role='textbox']"]
+    while time.monotonic() < deadline:
+        if _flow_page_has_captcha(page):
+            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                if any(loc.nth(i).is_visible() and loc.nth(i).is_enabled()
+                       for i in range(max(0, loc.count()-5), loc.count())):
+                    workflow_cmd_log("FLOW","PROJECT_ALREADY_OPEN")
+                    return
+            except Exception:
+                pass
+        # Old-tool semantics: click the visible New/Create project control, then
+        # confirm the project creation dialog if Flow shows one.
+        clicked = False
+        for label in (
+            r"^New project$", r"^Create new$", r"^New$", r"^Tạo dự án$",
+            r"^Tạo mới$", r"New project", r"Create project"
+        ):
+            try:
+                btn = page.get_by_role("button", name=re.compile(label, re.I)).last
+                if btn.count() and btn.is_visible() and btn.is_enabled():
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=5000)
+                    workflow_cmd_log("FLOW","CREATE_PROJECT_CLICKED",label=label)
+                    clicked = True
+                    break
+            except Exception:
+                pass
+        if clicked:
+            # Some Flow builds open a dialog requiring a second Create/Continue.
+            for _ in range(20):
+                for label in (r"^Create$", r"^Continue$", r"^Tạo$", r"^Tiếp tục$"):
+                    try:
+                        btn = page.get_by_role("button", name=re.compile(label, re.I)).last
+                        if btn.count() and btn.is_visible() and btn.is_enabled():
+                            btn.click(timeout=3000)
+                            workflow_cmd_log("FLOW","CREATE_PROJECT_CONFIRMED",label=label)
+                            break
+                    except Exception:
+                        pass
+                time.sleep(0.5)
+                for sel in selectors:
+                    try:
+                        loc = page.locator(sel)
+                        for i in range(max(0,loc.count()-5),loc.count()):
+                            item=loc.nth(i)
+                            if item.is_visible() and item.is_enabled():
+                                workflow_cmd_log("FLOW","PROJECT_READY")
+                                return
+                    except Exception:
+                        pass
+        time.sleep(0.5)
+    raise CreativeFlowUnavailable("Không thể mở/tạo Project Google Flow hoặc không xuất hiện ô Prompt.")
+
+
 def _flow_find_prompt_box(page, timeout=30):
+    _flow_create_project(page, timeout=max(15, int(timeout)))
     deadline = time.monotonic() + max(5, int(timeout))
     selectors = ["textarea","[contenteditable='true']","[role='textbox']","input[type='text']"]
     while time.monotonic() < deadline:
@@ -19726,23 +19788,15 @@ def _flow_find_prompt_box(page, timeout=30):
                         return item
             except Exception:
                 pass
-        # First-run recovery: if Flow opened at the project picker and no prompt
-        # exists, create one project. It is never done once a prompt box exists.
-        try:
-            for label in ("New project","+ New project","New"):
-                btn = page.get_by_role("button", name=re.compile(re.escape(label),re.I)).last
-                if btn.count() and btn.is_visible() and btn.is_enabled():
-                    btn.click()
-                    workflow_cmd_log("FLOW","NEW_PROJECT_CREATED",reason="prompt_box_missing")
-                    break
-        except Exception:
-            pass
         time.sleep(0.5)
     try:
         body=(page.locator("body").inner_text(timeout=2000) or "")[:1200]
     except Exception:
         body=""
-    raise CreativeFlowUnavailable(f"Không tìm thấy Prompt Box Google Flow sau 30s · url={str(page.url or '')[:300]} · body={body!r}")
+    raise CreativeFlowUnavailable(
+        f"Không tìm thấy Prompt Box Google Flow sau {timeout}s · "
+        f"url={str(page.url or '')[:300]} · body={body!r}"
+    )
 
 def _flow_click_generate_image(page):
     for pat in (r"^Generate Image$",r"Generate Image",r"^Generate$",r"Create Image"):
@@ -19852,18 +19906,29 @@ def _flow_run_real_v115(self,job,worker_id,account_id=None):
             workflow_cmd_log("FLOW","PROMPT_IMPORT_START",account_id=account_id,scene=job.get("scene_id"),prompt_chars=len(prompt))
             box=_flow_find_prompt_box(page,30)
             box.click()
-            try: box.press("Control+A")
-            except Exception: pass
-            box.fill(prompt)
+            try:
+                box.press("Control+A")
+            except Exception:
+                pass
+            # Use real browser text insertion after focus/select, matching the old
+            # tool's visible paste operation instead of JS-setting React state.
+            try:
+                page.keyboard.insert_text(prompt)
+            except Exception:
+                box.fill(prompt)
             workflow_cmd_log("FLOW","PROMPT_IMPORTED",account_id=account_id,scene=job.get("scene_id"))
-            try: box.press("Control+Enter")
-            except Exception: pass
+            try:
+                box.press("Control+Enter")
+            except Exception:
+                pass
             if _flow_page_has_captcha(page):
                 raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
             try: before_img_count=page.locator("img").count()
             except Exception: before_img_count=0
             if not _flow_click_generate_image(page):
-                raise CreativeFlowUnavailable("Không tìm thấy nút Generate Image của Google Flow.")
+                raise CreativeFlowUnavailable(
+                    "Không tìm thấy nút Generate/Create của Google Flow sau khi đã tạo Project và nhập Prompt."
+                )
             workflow_cmd_log("FLOW","GENERATE_CLICKED",account_id=account_id,scene=job.get("scene_id"))
             _creative_heartbeat(worker_id,job["job_id"])
             download=_flow_download_latest_asset(page,before_img_count,CREATIVE_FLOW_RESULT_TIMEOUT)
