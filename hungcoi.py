@@ -19902,67 +19902,57 @@ def _flow_generation_started(page, before_img_count=0):
 
 
 def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
-    """Submit exactly once, like the old Creative Studio.
+    """Click Flow's actual image-generation submit control once.
 
-    Prefer a real Generate/Create control. Keyboard submission is only a
-    last-resort fallback and must show evidence that generation started.
+    This is deliberately scoped to the prompt composer. It never clicks an
+    arbitrary last button and never treats a project/menu button as Generate.
     """
-    patterns = (
+    def _click(loc):
+        try:
+            for i in range(loc.count() - 1, -1, -1):
+                btn = loc.nth(i)
+                if not btn.is_visible() or not btn.is_enabled():
+                    continue
+                btn.scroll_into_view_if_needed()
+                btn.click(timeout=5000)
+                return True
+        except Exception:
+            return False
+        return False
+
+    # 1) Exact accessible names used by Flow builds.
+    for pat in (
         r"^Generate Image$", r"^Generate images?$", r"^Generate$",
         r"^Create Image$", r"^Create images?$", r"^Create$",
         r"^Run$", r"^Tạo ảnh$", r"^Tạo hình$", r"^Tạo$",
-    )
-    for pat in patterns:
+    ):
         try:
-            loc = page.get_by_role("button", name=re.compile(pat, re.I))
-            for i in range(loc.count() - 1, -1, -1):
-                btn = loc.nth(i)
-                if btn.is_visible() and btn.is_enabled():
-                    btn.scroll_into_view_if_needed()
-                    btn.click(timeout=5000)
-                    return True
+            if _click(page.get_by_role("button", name=re.compile(pat, re.I))):
+                return True
         except Exception:
             pass
 
+    # 2) Icon-only Flow controls normally expose one of these accessibility/
+    # tooltip attributes. Only click a control whose own label says generate.
     try:
-        buttons = page.locator("button,[role='button']")
-        for i in range(buttons.count() - 1, -1, -1):
-            btn = buttons.nth(i)
-            try:
-                if not btn.is_visible() or not btn.is_enabled():
-                    continue
-                parts = []
-                for attr in (
-                    "aria-label", "title", "data-testid", "data-test-id",
-                    "data-tooltip", "name"
-                ):
-                    v = btn.get_attribute(attr)
-                    if v:
-                        parts.append(str(v))
-                try:
-                    parts.append(btn.inner_text(timeout=250) or "")
-                except Exception:
-                    pass
-                label = " ".join(parts)
-                if re.search(
-                    r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?",
-                    label,
-                    re.I,
-                ):
-                    if re.search(
-                        r"project|new\s+project|menu|settings|upload|attach|delete",
-                        label,
-                        re.I,
-                    ):
-                        continue
-                    btn.scroll_into_view_if_needed()
-                    btn.click(timeout=5000)
-                    return True
-            except Exception:
-                continue
+        loc = page.locator(
+            "button[aria-label*='generate' i],"
+            "button[aria-label*='create image' i],"
+            "button[title*='generate' i],"
+            "button[title*='create image' i],"
+            "[role='button'][aria-label*='generate' i],"
+            "[role='button'][data-tooltip*='generate' i],"
+            "[role='button'][data-tooltip-content*='generate' i],"
+            "[role='button'][data-testid*='generate' i]"
+        )
+        if _click(loc):
+            return True
     except Exception:
         pass
 
+    # 3) Inspect controls inside the same prompt composer. This is the safe
+    # fallback for Flow builds where the Generate button is icon-only and has
+    # no accessible name. We reject navigation/project/upload/menu controls.
     box = prompt_box
     if box is None:
         try:
@@ -19971,19 +19961,48 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
             box = None
     if box is not None:
         try:
-            box.click(timeout=3000)
+            composer = box.locator(
+                "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
+            )
+            controls = composer.locator("button,[role='button']")
+            for i in range(controls.count() - 1, -1, -1):
+                btn = controls.nth(i)
+                try:
+                    if not btn.is_visible() or not btn.is_enabled():
+                        continue
+                    label = " ".join(
+                        filter(None, (
+                            btn.get_attribute("aria-label"),
+                            btn.get_attribute("title"),
+                            btn.get_attribute("data-tooltip"),
+                            btn.get_attribute("data-tooltip-content"),
+                            btn.get_attribute("data-testid"),
+                            btn.inner_text(timeout=250),
+                        ))
+                    )
+                    if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?", label, re.I):
+                        if not re.search(r"project|new\s+project|upload|attach|settings|menu|more|delete|cancel|close", label, re.I):
+                            btn.scroll_into_view_if_needed()
+                            btn.click(timeout=5000)
+                            return True
+                except Exception:
+                    continue
         except Exception:
             pass
-        for key in ("Control+Enter", "Enter"):
-            try:
-                box.press(key)
-            except Exception:
-                continue
-            deadline = time.monotonic() + 4.0
+
+    # 4) Last resort: use the composer submit shortcut only, then require
+    # visible generation evidence. No blind Enter/click is allowed.
+    if box is not None:
+        try:
+            box.click(timeout=3000)
+            box.press("Control+Enter")
+            deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 if _flow_generation_started(page, before_img_count):
                     return True
                 time.sleep(0.25)
+        except Exception:
+            pass
     return False
 
 def _flow_download_latest_asset(page,before_img_count,timeout=900):
