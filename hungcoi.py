@@ -7823,14 +7823,14 @@ def _flow_generation_started(page, before_img_count=0):
 
 
 def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
-    """Submit the current Flow scene through the real composer control.
+    """Submit one scene through the real Google Flow composer.
 
-    Priority is deliberately strict:
-      1) exact accessible Generate/Create/Run control;
-      2) the same control inside the prompt composer;
-      3) an unlabeled icon button in that composer, using geometry + SVG/tooltip
-         evidence and rejecting upload/menu/settings/destructive controls;
-      4) keyboard submit only when Flow visibly enters a generation state.
+    Ported from the legacy Creative Studio behavior, but kept safe:
+      1) exact accessible Generate/Create/Run controls;
+      2) legacy Playwright text-button matching (has_text);
+      3) explicit generate/create test-id/aria/title controls;
+      4) controls belonging to the same prompt composer;
+      5) only then keyboard submit, and only if Flow visibly starts generation.
 
     Never click an arbitrary page button.
     """
@@ -7848,8 +7848,10 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
 
     def _label(btn):
         vals = []
-        for name in ("aria-label", "title", "data-testid", "data-test-id",
-                     "data-tooltip", "data-tooltip-content", "name"):
+        for name in (
+            "aria-label", "title", "data-testid", "data-test-id",
+            "data-tooltip", "data-tooltip-content", "name"
+        ):
             try:
                 v = btn.get_attribute(name)
                 if v:
@@ -7868,27 +7870,82 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
                 return False
             btn.scroll_into_view_if_needed()
             btn.click(timeout=5000)
-            workflow_cmd_log("FLOW", "GENERATE_CONTROL_CLICKED",
-                             method=tag, label=_label(btn)[:300])
+            workflow_cmd_log(
+                "FLOW", "GENERATE_CONTROL_CLICKED",
+                method=tag, label=_label(btn)[:300]
+            )
             return True
         except Exception as exc:
-            workflow_cmd_log("FLOW", "GENERATE_CONTROL_CLICK_FAILED",
-                             method=tag, error=str(exc)[:500], level="DEBUG")
+            workflow_cmd_log(
+                "FLOW", "GENERATE_CONTROL_CLICK_FAILED",
+                method=tag, error=str(exc)[:500], level="DEBUG"
+            )
             return False
 
-    for pat in (
-        r"^Generate Image$", r"^Generate images?$", r"^Generate$",
-        r"^Create Image$", r"^Create images?$", r"^Create$",
-        r"^Run$", r"^Submit$", r"^Send$",
-        r"^Tạo ảnh$", r"^Tạo hình$", r"^Tạo$",
-    ):
+    # 1) Exact accessible names.
+    exact_patterns = (
+        r"^Generate Image$",
+        r"^Generate images?$",
+        r"^Generate$",
+        r"^Create Image$",
+        r"^Create images?$",
+        r"^Create$",
+        r"^Run$",
+        r"^Submit$",
+        r"^Send$",
+        r"^Tạo ảnh$",
+        r"^Tạo hình$",
+        r"^Tạo$",
+    )
+    for pat in exact_patterns:
         try:
-            btn = _visible_enabled(page.get_by_role("button", name=re.compile(pat, re.I)))
+            btn = _visible_enabled(
+                page.get_by_role("button", name=re.compile(pat, re.I))
+            )
             if _safe_click(btn, "exact-accessible"):
                 return True
         except Exception:
             pass
 
+    # 2) Legacy Creative Studio behavior: Flow builds that expose visible
+    #    button text but do not expose the same accessible name.
+    legacy_labels = (
+        "Generate", "Generate Image", "Create", "Create Image",
+        "Run", "Submit", "Send", "Tạo", "Tạo ảnh", "Tạo hình"
+    )
+    for label in legacy_labels:
+        try:
+            loc = page.get_by_role("button").filter(
+                has_text=re.compile(r"^\s*" + re.escape(label) + r"\s*$", re.I)
+            )
+            btn = _visible_enabled(loc)
+            if _safe_click(btn, "legacy-has-text"):
+                return True
+        except Exception:
+            pass
+
+    # 3) Explicit DOM attributes used by Flow UI builds.
+    try:
+        attr = page.locator(
+            "button[aria-label*='generate' i],"
+            "button[aria-label*='create image' i],"
+            "button[title*='generate' i],"
+            "button[title*='create image' i],"
+            "[role='button'][aria-label*='generate' i],"
+            "[role='button'][aria-label*='create image' i],"
+            "[data-testid*='generate' i],"
+            "[data-testid*='create-image' i],"
+            "[data-testid*='create_image' i],"
+            "[data-test-id*='generate' i],"
+            "[data-test-id*='create-image' i]"
+        )
+        btn = _visible_enabled(attr)
+        if _safe_click(btn, "explicit-generate-attribute"):
+            return True
+    except Exception:
+        pass
+
+    # 4) Search only inside the prompt composer, never the whole page.
     composer_roots = []
     try:
         root = box.locator(
@@ -7896,13 +7953,16 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
         )
         composer_roots.append(root)
         composer_roots.append(
-            root.locator("xpath=ancestor::*[.//button or .//*[@role='button']][1]")
+            root.locator(
+                "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
+            )
         )
     except Exception:
         pass
 
     submit_re = re.compile(
-        r"generate|create\s*(?:image|images|video)?|submit|run|send|tạo\s*(?:ảnh|hình)?",
+        r"generate|create\s*(?:image|images|video)?|submit|run|send|"
+        r"tạo\s*(?:ảnh|hình)?",
         re.I,
     )
     reject_re = re.compile(
@@ -7925,6 +7985,8 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
         except Exception:
             continue
 
+    # 5) Icon-only Generate button: restrict to the composer geometry and
+    #    require SVG evidence. This avoids clicking upload/menu/settings.
     try:
         bb = box.bounding_box()
     except Exception:
@@ -7958,15 +8020,11 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
                         )
                         if not near:
                             continue
-                        try:
-                            html_fragment = btn.inner_html(timeout=250)
-                        except Exception:
-                            html_fragment = ""
-                        has_svg = "<svg" in (html_fragment or "").lower()
-                        has_path = "<path" in (html_fragment or "").lower()
-                        if not has_svg:
+                        html_fragment = btn.inner_html(timeout=250) or ""
+                        html_low = html_fragment.lower()
+                        if "<svg" not in html_low:
                             continue
-                        score = 2 + (1 if has_path else 0)
+                        score = 2 + (1 if "<path" in html_low else 0)
                         score += int(max(0, cx - bx) / max(1, bw) * 3)
                         score += int(max(0, cy - by) / max(1, bh) * 2)
                         candidates.append((score, cx, cy, btn))
@@ -7984,6 +8042,8 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
             except Exception:
                 continue
 
+    # 6) Submit the actual textbox, but accept it only when Flow enters a
+    #    generation state. This mirrors the old tool's Enter fallback safely.
     for key in ("Control+Enter", "Enter"):
         try:
             box.click(timeout=3000)
@@ -7991,13 +8051,35 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
             deadline = time.monotonic() + 8
             while time.monotonic() < deadline:
                 if _flow_generation_started(page, before_img_count):
-                    workflow_cmd_log("FLOW", "GENERATE_KEYBOARD_ACCEPTED", key=key)
+                    workflow_cmd_log(
+                        "FLOW", "GENERATE_KEYBOARD_ACCEPTED", key=key
+                    )
                     return True
                 time.sleep(0.2)
         except Exception:
             continue
 
+    # Diagnostic only: record the visible button labels so the next failure
+    # identifies the actual Flow control instead of saying only "not found".
+    try:
+        visible = []
+        buttons = page.locator("button,[role='button']")
+        for i in range(buttons.count()):
+            b = buttons.nth(i)
+            if b.is_visible():
+                lab = _label(b)
+                if lab:
+                    visible.append(lab[:180])
+        workflow_cmd_log(
+            "FLOW", "GENERATE_CONTROL_NOT_FOUND",
+            visible_buttons=visible[-40:],
+            url=str(page.url or "")[:500],
+            level="ERROR",
+        )
+    except Exception:
+        pass
     return False
+
 
 def _flow_download_latest_asset(page,before_img_count,timeout=900):
     """Wait for the generated asset and click Flow's visible Download control."""
