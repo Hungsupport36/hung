@@ -1,4 +1,4 @@
-name: V11.6.4 Repair Creative Studio verify recursion
+name: V11.6.5 Repair Creative Studio verify recursion
 
 on:
   push:
@@ -27,32 +27,34 @@ jobs:
 
           p = Path("hungcoi.py")
           s = p.read_text(encoding="utf-8")
-
           tree = ast.parse(s, filename="hungcoi.py")
           lines = s.splitlines(keepends=True)
 
-          # Keep the FIRST real async implementation. The broken patch created
-          # duplicate *_impl definitions whose bodies call themselves forever.
-          impl_nodes = [
-              n for n in ast.walk(tree)
-              if isinstance(n, ast.AsyncFunctionDef)
-              and n.name == "_creative_flow_manual_profile_verify_async_impl"
-          ]
-          if not impl_nodes:
-              raise SystemExit("Real async Flow profile verify implementation not found")
-          impl_node = sorted(impl_nodes, key=lambda n: n.lineno)[0]
-          impl_source = "".join(lines[impl_node.lineno-1:impl_node.end_lineno])
+          def nodes_named(name):
+              return sorted(
+                  [
+                      n for n in ast.walk(tree)
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and n.name == name
+                  ],
+                  key=lambda n: n.lineno,
+              )
 
-          marker = "def _creative_account_pool_html("
-          marker_i = s.find(marker)
-          if marker_i < 0:
-              raise SystemExit("Creative account pool marker not found")
+          impls = nodes_named("_creative_flow_manual_profile_verify_async_impl")
+          pools = nodes_named("_creative_account_pool_html")
+          if not impls or not pools:
+              raise SystemExit("Required Flow verify/account-pool AST nodes not found")
 
-          # Preserve everything before the first real implementation, then
-          # replace ALL duplicated/corrupt wrappers up to account-pool HTML.
-          impl_start = s.find("async def _creative_flow_manual_profile_verify_async_impl")
-          if impl_start < 0 or impl_start >= marker_i:
-              raise SystemExit("Flow verify implementation boundary invalid")
+          # Keep the earliest real implementation and discard all duplicate
+          # wrappers/impl definitions until the account-pool section.
+          impl_node = impls[0]
+          pool_node = next((n for n in pools if n.lineno > impl_node.lineno), None)
+          if pool_node is None:
+              raise SystemExit("No account-pool function after Flow verify implementation")
+
+          start = impl_node.lineno - 1
+          end = pool_node.lineno - 1
+          impl_source = "".join(lines[start:impl_node.end_lineno])
 
           clean = textwrap.dedent(r'''
           async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
@@ -145,29 +147,30 @@ jobs:
 
           ''').lstrip()
 
-          prefix = s[:impl_start]
-          suffix = s[marker_i:]
-          s = prefix + impl_source + "\n\n" + clean + suffix
+          new_s = "".join(lines[:start]) + impl_source.rstrip() + "\n\n" + clean + "".join(lines[end:])
 
-          ast.parse(s, filename="hungcoi.py")
-
-          # Hard safety checks: no recursive self-call remains in either wrapper.
+          final_tree = ast.parse(new_s, filename="hungcoi.py")
           for name in (
+              "_creative_flow_manual_profile_verify_async_impl",
               "_creative_flow_manual_profile_verify_async",
               "_creative_flow_manual_profile_verify_impl",
               "_creative_flow_manual_profile_verify",
           ):
-              nodes = [
-                  n for n in ast.walk(ast.parse(s, filename="hungcoi.py"))
-                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
-              ]
-              if len(nodes) != 1:
-                  raise SystemExit(f"{name}: expected exactly 1 definition, found {len(nodes)}")
-          if "_result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_impl(*args, **kwargs)" in s:
-              raise SystemExit("Recursive wrapper pattern still present")
+              count = sum(
+                  1 for n in ast.walk(final_tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == name
+              )
+              if count != 1:
+                  raise SystemExit(f"{name}: expected 1 definition, got {count}")
 
-          p.write_text(s, encoding="utf-8")
-          print("V11.6.4: Creative Studio Flow profile verify recursion repaired")
+          if "return await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else" in new_s:
+              raise SystemExit("Recursive conditional wrapper still present")
+          if "_result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else" in new_s:
+              raise SystemExit("Recursive wrapper expression still present")
+
+          p.write_text(new_s, encoding="utf-8")
+          print("V11.6.5: Flow profile verify recursion repaired; AST OK")
 
       - name: Commit repair
         shell: bash
@@ -179,5 +182,5 @@ jobs:
             echo "No changes"
             exit 0
           fi
-          git commit -m "V11.6.4: repair Flow profile verify recursion"
+          git commit -m "V11.6.5: repair Flow profile verify recursion"
           git push origin HEAD:fix/creative-studio-v7
