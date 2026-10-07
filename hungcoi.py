@@ -14465,25 +14465,33 @@ def _creative_import_flow_accounts(raw_text, replace=False):
 
 
 def _creative_flow_account_open(account_id):
-    """Open one existing account profile for manual Google login/CAPTCHA resolution."""
+    """Open/re-open one existing Flow profile without creating a new account."""
     aid = str(account_id or "").strip()
     if not aid:
         return _creative_account_pool_html(), "🔴 Chưa chọn Account."
-    if not _creative_get_account(aid):
+    row = _creative_get_account(aid)
+    if not row:
         return _creative_account_pool_html(), f"🔴 Không tìm thấy Account: {aid}"
     try:
         global _CREATIVE_FLOW_ADAPTER
         if _CREATIVE_FLOW_ADAPTER is None:
             _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        profile = str(row.get("session_profile") or "").strip()
+        if not profile:
+            raise RuntimeError(f"{aid} chưa có session_profile.")
+        # _context() now reopens the SAME profile with installed Chrome Stable
+        # when the previous Chrome window was closed.
         _CREATIVE_FLOW_ADAPTER._context(aid)
-        workflow_cmd_log("FLOW_POOL", "SESSION_OPEN", account_id=aid)
+        workflow_cmd_log("FLOW_POOL", "SESSION_OPEN_OR_REOPEN", account_id=aid, profile=profile)
         return _creative_account_pool_html(), (
-            f"🟡 Đã mở session {aid}. Đăng nhập Google/Flow hoặc xử lý CAPTCHA thủ công, "
-            "sau đó bấm VERIFY Account."
+            f"🟡 Đã mở/re-open session {aid} · dùng đúng Profile cũ.
+"
+            "Đăng nhập Google/Flow hoặc xử lý CAPTCHA thủ công, sau đó bấm VERIFY Account."
         )
     except Exception as exc:
         _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
-        return _creative_account_pool_html(), f"🔴 Không mở được session {aid}: {str(exc)[:700]}"
+        workflow_cmd_log("FLOW_POOL", "SESSION_OPEN_ERROR", account_id=aid, detail=str(exc)[:1000], level="ERROR")
+        return _creative_account_pool_html(), f"🔴 Không mở/re-open được session {aid}: {str(exc)[:700]}"
 
 
 def _creative_flow_account_verify(account_id):
@@ -14659,7 +14667,7 @@ def _flow_cdp_ready(port, timeout=8):
     return False
 
 def _flow_create_manual_profile(profile_path=""):
-    """Create/register a profile; user performs Google/Flow login manually."""
+    """Create/register exactly one NEW profile; re-opening uses account_open instead."""
     _flow_account_schema()
     aid = _flow_next_profile_id()
     p = Path(str(profile_path).strip()).expanduser().resolve() if str(profile_path or "").strip() else FLOW_PROFILE_ROOT / safe_name(aid)
@@ -14672,7 +14680,7 @@ def _flow_create_manual_profile(profile_path=""):
             "VALUES(?,?,?,?,?,?,?,?,?)",
             (aid, "GOOGLE_FLOW", "DISABLED", str(p), "", str(_flow_storage_paths(aid)[1]), port, now, now)
         )
-    workflow_cmd_log("FLOW_POOL", "PROFILE_REGISTERED", account_id=aid, profile=str(p))
+    workflow_cmd_log("FLOW_POOL", "PROFILE_REGISTERED_NEW", account_id=aid, profile=str(p))
     return aid, str(p)
 
 def _creative_flow_manual_profile_open(profile_path=""):
@@ -14901,17 +14909,19 @@ def _flow_context_registered_profile(self, account_id):
     from playwright.sync_api import sync_playwright
     port = int((row or {}).get("debug_port") or _flow_debug_port(account_id))
     if not _flow_cdp_ready(port, timeout=3):
-        # Existing V10/manual profiles may not have a running Chrome yet.
+        # Chrome may have been closed by the user. Re-open the SAME tool-owned
+        # profile with real installed Chrome Stable, then attach over CDP.
+        # Do not use launch_persistent_context(channel="chrome") here: that
+        # creates a second Playwright-managed browser lifecycle and can leave
+        # the profile locked after the user closes Chrome.
         p = Path(profile).expanduser().resolve()
         p.mkdir(parents=True, exist_ok=True)
-        pw = sync_playwright().start()
-        browser = pw.chromium.launch_persistent_context(
-            str(p), headless=False, channel="chrome",
-            args=["--disable-background-networking"],
-        )
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
-        return pw, browser, page
+        try:
+            _flow_launch_stable_chrome(account_id, str(p), self.FLOW_URL)
+        except Exception as exc:
+            raise RuntimeError(f"Không thể mở lại Chrome Stable cho {account_id}: {exc}")
+        if not _flow_cdp_ready(port, timeout=10):
+            raise RuntimeError(f"Chrome đã được gọi mở lại nhưng CDP chưa sẵn sàng cho {account_id}.")
     # Connect to the already-running stable Chrome instance in THIS thread.
     # Do not reuse Playwright objects created by another thread.
     pw = sync_playwright().start()
