@@ -6673,15 +6673,19 @@ def _gemini_channel_search_tool_urls(channel_urls, project=""):
         atom_ns = "http://www.w3.org/2005/Atom"
         session = requests.Session()
         session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/153 Safari/537.36"})
+        discovery_deadline = time.monotonic() + 20.0
 
         for channel_url in urls:
+            if time.monotonic() >= discovery_deadline:
+                workflow_cmd_log("GEMINI", "YOUTUBE_CHANNEL_DISCOVERY_DEADLINE", project=project or "", level="WARN", pct=24)
+                break
             channel_id = ""
             m = re.search(r"youtube(?:-nocookie)?\.com/channel/(UC[\w-]{15,})", channel_url, re.I)
             if m:
                 channel_id = m.group(1)
             else:
                 try:
-                    resp = session.get(channel_url, timeout=15, allow_redirects=True)
+                    resp = session.get(channel_url, timeout=8, allow_redirects=True)
                     resp.raise_for_status()
                     html = resp.text or ""
                     patterns = [
@@ -6707,7 +6711,7 @@ def _gemini_channel_search_tool_urls(channel_urls, project=""):
 
             feed_url = f"https://www.youtube.com/feeds/videos.xml?channel_id={channel_id}"
             try:
-                resp = session.get(feed_url, timeout=15)
+                resp = session.get(feed_url, timeout=8)
                 resp.raise_for_status()
                 root = ET.fromstring(resp.content)
                 found_for_channel = []
@@ -6810,7 +6814,7 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
     # Keep the original channel URLs in the competitor gate, but never pretend the channel
     # page itself was inspected as a URL-Context document.
     discovered_channel_video_urls = []
-    if youtube_channel_urls:
+    if youtube_channel_urls and not youtube_video_urls:
         workflow_cmd_log('GEMINI', 'YOUTUBE_CHANNEL_URL_CONTEXT_UNSUPPORTED', project=project or '',
                          count=len(youtube_channel_urls), urls=' | '.join(youtube_channel_urls),
                          level='INFO')
@@ -7033,6 +7037,7 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                     # The client-wide timeout is the actual transport deadline.
                     # Keep this request isolated so a URL Context failure is handled
                     # by the key-failover path below rather than blocking Master.
+                    workflow_cmd_log("GEMINI", "API_CALL_ENTER", project=project or "", key_index=index + 1, model=GEMINI_MODEL, response_mode=response_mode or "", pct=32)
                     result = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=config)
                     workflow_cmd_log(
                         'GEMINI', 'COMPETITOR_TOOLS_REQUEST_OK', project=project or '',
@@ -7059,6 +7064,7 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                     ) from tool_exc
             else:
                 safe_config = config
+                workflow_cmd_log("GEMINI", "API_CALL_ENTER", project=project or "", key_index=index + 1, model=GEMINI_MODEL, response_mode=response_mode or "", pct=32)
                 result = client.models.generate_content(model=GEMINI_MODEL, contents=contents, config=safe_config)
             if SCRIPT_STOP_EVENT.is_set() or FULL_STOP_EVENT.is_set() or PROMPT_STOP_EVENT.is_set():
                 raise RuntimeError("Gemini request đã hoàn tất nhưng workflow đã nhận STOP; không tiếp tục parse/lưu dữ liệu.")
@@ -17840,6 +17846,7 @@ def launch_ui():
                             yield 12, f'🟡 ĐANG CHỜ ⏳ Gemini B1 — lượt 1/3 · 00:00 · Character Reference: {len(reference_images)}/3 ảnh', prompt_scene_rows(scenes), gr.update(visible=False), gr.update(visible=False), gr.update(visible=False), int(attempt_token) + 1, ''
                             if FULL_STOP_EVENT.is_set() or PROMPT_STOP_EVENT.is_set() or SCRIPT_STOP_EVENT.is_set():
                                 raise RuntimeError('Đã dừng trước khi gửi FULL Kịch bản cho Gemini.')
+                            workflow_cmd_log("GEMINI", "B1_API_CALL_ENTER", project=project_name, reference_count=len(reference_images), competitor_url_count=len(competitor_urls), pct=13)
                             topic_raw = _gemini_api_text(
                                 topic_style_request,
                                 reference_images=list(reference_images or [])[:3],
