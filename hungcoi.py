@@ -13531,39 +13531,37 @@ def _selected_image_engine():
     return value if value in {"GOOGLE_FLOW", "Z_IMAGE"} else "GOOGLE_FLOW"
 
 def _creative_environment_check(engine=None):
-    """Strict gate: selected engine must actually be usable before Master."""
-    engine = str(engine or _selected_image_engine()).upper().strip()
-    if engine == "Z_IMAGE":
+    """Strict engine gate without Sync Playwright calls from UI/asyncio."""
+    engine=str(engine or _selected_image_engine()).upper().strip()
+    if engine==CREATIVE_ENGINE_ZIMAGE:
         try:
-            if not callable(globals().get("run_zimage_txt2img_queue")):
-                return False, "🔴 Z Image chưa sẵn sàng: chưa có Z Image queue."
-            ok = bool(_zimage_startup_preflight()) if callable(globals().get("_zimage_startup_preflight")) else True
-            return (True, "🟢 Z Image LOCAL CONNECTED") if ok else (False, "🔴 Z Image/ComfyUI chưa CONNECTED.")
-        except Exception as exc:
-            return False, f"🔴 Z Image CONNECT ERROR: {str(exc)[:500]}"
-    try:
-        from playwright.sync_api import sync_playwright
-    except Exception:
-        return False, "🔴 Google Flow chưa sẵn sàng: thiếu Playwright."
+            if not callable(globals().get("run_zimage_txt2img_queue")): return False,"🔴 Z Image chưa sẵn sàng: chưa có Z Image queue."
+            ok=bool(_zimage_startup_preflight()) if callable(globals().get("_zimage_startup_preflight")) else True
+            return (True,"🟢 Z Image LOCAL CONNECTED") if ok else (False,"🔴 Z Image/ComfyUI chưa CONNECTED.")
+        except Exception as exc: return False,f"🔴 Z Image CONNECT ERROR: {str(exc)[:500]}"
     try:
         _creative_v3_migrate()
         with _batch_db() as db:
-            row = db.execute(
-                "SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' "
-                "AND status='ACTIVE' AND (cooldown_until IS NULL OR cooldown_until<=?) "
-                "ORDER BY last_success DESC LIMIT 1", (_creative_now(),)
+            row=db.execute(
+                "SELECT account_id,session_profile,debug_port,session_health,status FROM creative_accounts "
+                "WHERE provider='GOOGLE_FLOW' AND status='ACTIVE' "
+                "AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY last_success DESC LIMIT 1",
+                (_creative_now(),)
             ).fetchone()
-        if not row:
-            return False, "🔴 Google Flow chưa CONNECTED: chưa có Account ACTIVE."
-        global _CREATIVE_FLOW_ADAPTER
-        if _CREATIVE_FLOW_ADAPTER is None:
-            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
-        result = _CREATIVE_FLOW_ADAPTER.health_check(str(row["account_id"]))
-        if not result.get("ok"):
-            return False, f"🔴 Google Flow NOT CONNECTED: {result.get('detail','Unknown')}"
-        return True, "🟢 Google Flow CONNECTED · Playwright + Browser + Session OK"
+        if not row: return False,"🔴 Google Flow chưa CONNECTED: chưa có Account ACTIVE."
+        profile=str(row["session_profile"] or "").strip()
+        if not profile or not Path(profile).exists():
+            return False,f"🔴 Google Flow ACTIVE nhưng Profile không tồn tại: {profile or 'trống'}"
+        # Do not call Playwright Sync API here. The real worker performs the
+        # thread-local CDP attach and will reopen Chrome Stable if it was closed.
+        port=int(row["debug_port"] or _flow_debug_port(row["account_id"]))
+        cdp=bool(_flow_cdp_ready(port,timeout=1))
+        health=str(row["session_health"] or "UNKNOWN")
+        detail=f"🟢 Google Flow CONNECTED · {row['account_id']} · Profile READY · " + ("Chrome/CDP READY" if cdp else "Chrome sẽ tự mở lại khi Worker chạy")
+        workflow_cmd_log("FLOW_POOL","ENV_GATE",account_id=row["account_id"],cdp_ready=cdp,session_health=health)
+        return True,detail
     except Exception as exc:
-        return False, f"🔴 Google Flow CONNECT ERROR: {str(exc)[:700]}"
+        return False,f"🔴 Google Flow CONNECT ERROR: {str(exc)[:700]}"
 
 def _save_image_engine_setting(engine):
     engine = str(engine or "GOOGLE_FLOW").upper().strip()
@@ -18451,39 +18449,30 @@ def launch_ui():
                                             pass
 
                 def _image_only_ui(project_name, rerender_all=False):
-                                    """IMAGE ONLY: verified Prompt -> Z-Image-Turbo. NEVER calls Gemini."""
-                                    project_name = safe_name(str(project_name or SETTINGS.get("selected_project", "") or ""))
+                                    """IMAGE ONLY: selected engine only; never silently switches to Z Image."""
+                                    project_name=safe_name(str(project_name or SETTINGS.get("selected_project","") or ""))
                                     if not project_name:
-                                        yield _workflow_progress_card("⛔ IMAGE ONLY: chưa chọn Project.", 0, "zimage")
-                                        return
-                                    prompt_ok, prompt_obj = _project_prompt_checkpoint(project_name)
+                                        yield _workflow_progress_card("⛔ IMAGE ONLY: chưa chọn Project.",0,"image"); return
+                                    prompt_ok,_=_project_prompt_checkpoint(project_name)
                                     if not prompt_ok:
-                                        workflow_cmd_log("MASTER", "IMAGE_ONLY_BLOCKED_PROMPT_CHECKPOINT", project=project_name)
-                                        msg = (
-                                            "⛔ IMAGE ONLY bị khóa — Prompt checkpoint chưa hợp lệ cho script hiện tại. "
-                                            "Không gọi Gemini; hãy chạy RESUME/RUN FAST để tạo lại Prompt."
-                                        )
-                                        yield _workflow_progress_card(msg, 0, "prompt")
-                                        return
-                                    workflow_cmd_log(
-                                        "MASTER", "IMAGE_ONLY_START", project=project_name,
-                                        prompt_script_sha256=str(prompt_obj.get("script_sha256") or "")[:16],
-                                        rerender_all=bool(rerender_all),
-                                        note="Gemini is forbidden in IMAGE_ONLY mode.",
-                                    )
-                                    yield _workflow_progress_card(
-                                        f"🖼 IMAGE ONLY · Prompt VERIFY OK · {len(load_manifest(project_name))} Scene → Z-Image-Turbo",
-                                        5, "zimage"
-                                    )
-                                    last = ""
-                                    for pct, status, hud in run_zimage_txt2img_queue(project_name):
-                                        last = str(status or "")
-                                        yield hud
-                                    if "MASTER_ZIMAGE_OK" in last:
-                                        workflow_cmd_log("MASTER", "IMAGE_ONLY_COMPLETE", project=project_name)
-                                    else:
-                                        workflow_cmd_log("MASTER", "IMAGE_ONLY_INCOMPLETE", project=project_name, status=last[:500], level="WARN")
-
+                                        yield _workflow_progress_card("⛔ IMAGE ONLY bị khóa — Prompt checkpoint chưa hợp lệ.",0,"prompt"); return
+                                    engine=_selected_image_engine();ok,detail=_creative_environment_check(engine)
+                                    if not ok: yield _workflow_progress_card(detail,0,"image"); return
+                                    scenes=load_manifest(project_name)
+                                    if not scenes: yield _workflow_progress_card("⛔ Không có Scene.",0,"image"); return
+                                    _creative_master_full(project_name,scenes,engine,start=True)
+                                    total=sum(1 for s in scenes if scene_media_type(s,"image")=="image");active_total=total*len(CREATIVE_IMAGE_ONLY_STAGES)
+                                    while True:
+                                        if _master_is_stopped(): _creative_stop(project_name);yield _workflow_progress_card("⏹ IMAGE ONLY đã dừng.",0,"image");return
+                                        with _batch_db() as db: rows=db.execute("SELECT scene_id,stage,status FROM creative_jobs WHERE project_id=?",(project_name,)).fetchall()
+                                        done=sum(1 for r in rows if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"]=="DONE")
+                                        failed=sum(1 for r in rows if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"]=="FAILED")
+                                        captcha=sum(1 for r in rows if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"]=="CAPTCHA")
+                                        pct=int(min(99,(done/active_total)*100)) if active_total else 100
+                                        status=f"{engine}: DONE {done}/{active_total} · CAPTCHA {captcha} · FAIL {failed}"
+                                        yield _workflow_progress_card(status,pct,"image")
+                                        if failed or (active_total and done>=active_total): return
+                                        time.sleep(1.0)
                 def _resume_project_ui(project_name):
                                     """Smart RESUME: if Prompt is valid, jump directly to Z-Image; otherwise continue Gemini only when needed."""
                                     project_name = safe_name(str(project_name or SETTINGS.get("selected_project", "") or ""))
