@@ -2942,7 +2942,10 @@ def _master_finish_if_qc_ok(zimage_status,final_qc_text,clean_status):
     clean_ok='CLEAN MAX VIP hoàn tất' in str(clean_status or '')
     if not (zimage_ok and qc_ok and clean_ok):
         with MASTER_STATE_LOCK: MASTER_RUNNING.clear()
-        workflow_cmd_log('MASTER','FINISHED_INCOMPLETE',zimage_ok=zimage_ok,final_qc=qc_ok,clean_ok=clean_ok,pct=0)
+        workflow_cmd_log('MASTER','FINISHED_INCOMPLETE',
+                             zimage_ok=zimage_ok, final_qc=qc_ok, clean_ok=clean_ok,
+                             pct=0, level='ERROR',
+                             detail=f'Workflow chưa đủ điều kiện hoàn tất · Ảnh={zimage_ok} QC={qc_ok} Dọn={clean_ok}')
         print(f"[{vietnam_now().strftime('%H:%M:%S')}] [WORKFLOW] Chưa hoàn tất · Ảnh={zimage_ok} QC={qc_ok} Dọn={clean_ok}",flush=True)
         return gr.Button(value='⏺ OFF — Chưa hoàn tất',variant='secondary'),'⛔ MASTER CHƯA HOÀN TẤT — không archive, không xác nhận thành công.'
     project=safe_name(str(SETTINGS.get('selected_project','') or ''))
@@ -3835,6 +3838,8 @@ def _workflow_event_label(stage, event, fields):
         "RUN_FAST_SMART_PREFLIGHT_SCENE_OK": "Chạy nhanh · Scene đã kiểm tra",
         "RUN_FAST_SMART_PREFLIGHT_FRESH_REQUIRED": "Chạy nhanh · cần dựng mới",
         "RUN_FAST_JUMP_ZIMAGE": "Chuyển sang Z-Image-Turbo",
+        "RUN_FAST_JUMP_IMAGE": "Chuyển sang tạo hình",
+        "FINISHED_INCOMPLETE": "Workflow dừng — chưa hoàn tất",
         "ZIMAGE_STAGE_START": "Bắt đầu tạo hình Z-Image-Turbo",
         "ZIMAGE_STAGE_COMPLETE": "Đã hoàn tất tạo hình Z-Image-Turbo",
         "ZIMAGE_STAGE_OK": "Z-Image-Turbo sẵn sàng",
@@ -6842,7 +6847,10 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
             raise RuntimeError(f'Ảnh tham chiếu không được hỗ trợ: {fp.name}')
         refs.append(fp)
 
-    max_attempts = max(1, min(3, int(max_attempts or 3)))
+    requested_attempts = max(1, min(3, int(max_attempts or 3)))
+    # If multiple keys are configured, allow one pass across the key pool instead
+    # of stopping after the default three attempts on the same credential set.
+    max_attempts = min(10, max(requested_attempts, len(keys)))
     last_exc = None
     local_attempt = 0
 
@@ -7056,8 +7064,9 @@ def _gemini_api_generate(prompt, reference_images=None, response_mode=None, proj
                     # same broken URL Context path. With one key, fail fast and tell
                     # the user exactly which capability failed.
                     raise _GeminiExplicitResponseError(
-                        'Gemini không truy xuất được công cụ nguồn đối thủ; không được giả định đã đọc URL.',
-                        retryable=False, mode=response_mode or ''
+                        'Gemini không truy xuất được công cụ nguồn đối thủ; không được giả định đã đọc URL. '
+                        f'Underlying tool error: {str(tool_exc)[:900]}',
+                        retryable=True, mode=response_mode or ''
                     ) from tool_exc
             else:
                 safe_config = config
@@ -18420,21 +18429,22 @@ def launch_ui():
                                     if existing_prompt_ok:
                                         scene_count = int(existing_prompt_obj.get("scene_count", 0) or 0)
                                         workflow_cmd_log(
-                                            "MASTER", "RUN_FAST_JUMP_ZIMAGE", project=project_name,
+                                            "MASTER", "RUN_FAST_JUMP_IMAGE", project=project_name,
+                                            engine=_selected_image_engine(),
                                             scene_count=scene_count,
                                             script_sha256=str(existing_prompt_obj.get("script_sha256") or _project_current_script_hash(project_name))[:16],
                                             reason="verified Prompt checkpoint",
                                         )
                                         msg = (
                                             f"♻ RUN FAST RESUME — Prompt VERIFY OK ({scene_count} Scene). "
-                                            "Bỏ qua B1/B2 Gemini → Z-Image-Turbo."
+                                            f"Bỏ qua B1/B2 Gemini → Engine đã chọn: {_selected_image_engine()}."
                                         )
                                         yield tuple([
                                             100, msg, prompt_scene_rows(load_manifest(project_name)),
                                             gr.update(visible=True, value="💾 Prompt đã VERIFY — sang Hình ảnh"),
                                             gr.update(visible=False), gr.update(visible=True),
                                             int(attempt_token or 0),
-                                            _workflow_progress_card(msg, 100, "zimage") + "\n\n[MASTER_PROMPT_RESUME_OK]"
+                                            _workflow_progress_card(msg, 100, "image") + "\n\n[MASTER_PROMPT_RESUME_OK]"
                                         ])
                                         return
                                     if not _master_voice_gate_ok(project_name):
