@@ -20632,14 +20632,19 @@ def _creative_claim_account_checked_v1161(worker_id, job_id, provider=CREATIVE_E
             return account_id, "OK"
         detail = str(detail or "")
         now = _creative_now()
+        is_captcha = any(
+            x in detail.upper()
+            for x in ("CAPTCHA", "VERIFY YOU ARE HUMAN", "UNUSUAL TRAFFIC", "SECURITY CHECK")
+        )
+        account_state = "CAPTCHA" if is_captcha else "AUTH_ERROR"
         with _batch_db() as db:
             db.execute(
-                "UPDATE creative_accounts SET status='AUTH_ERROR',last_error=?,updated_at=? WHERE account_id=?",
-                (detail[:1500], now, account_id),
+                "UPDATE creative_accounts SET status=?,last_error=?,updated_at=? WHERE account_id=?",
+                (account_state, detail[:1500], now, account_id),
             )
             db.execute(
-                "UPDATE creative_jobs SET status='RETRY',error_class='AUTH_ERROR',error=?,worker_id=NULL,account_id=NULL,ready_at=?,updated_at=? WHERE job_id=? AND status='RUNNING'",
-                (detail[:1500], now, now, job_id),
+                "UPDATE creative_jobs SET status='RETRY',error_class=?,error=?,worker_id=NULL,account_id=NULL,ready_at=?,updated_at=? WHERE job_id=? AND status='RUNNING'",
+                (account_state, detail[:1500], now, now, job_id),
             )
             db.execute(
                 "UPDATE creative_workers SET status='IDLE',job_id=NULL,account_id=NULL,updated_at=? WHERE worker_id=?",
