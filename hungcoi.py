@@ -14106,6 +14106,10 @@ def _creative_dispatch_worker_v7(worker_id, job):
                     return
                 _creative_set_actual_engine(job["job_id"], engine, reason)
                 if engine == CREATIVE_ENGINE_FLOW:
+                    # Create the thread-owned adapter BEFORE session health/claim.
+                    # This is what actually reopens the user's saved Chrome profile
+                    # when Chrome was closed.
+                    adapter = _flow_thread_adapter()
                     account_id, detail = _creative_claim_account_checked(worker_id, job["job_id"], "GOOGLE_FLOW")
                     if not account_id:
                         if detail == "NO_ACTIVE_ACCOUNT":
@@ -14113,10 +14117,6 @@ def _creative_dispatch_worker_v7(worker_id, job):
                         else:
                             _creative_release_worker(worker_id, "IDLE", detail)
                         return
-                    # Keep Sync Playwright strictly inside this worker thread.
-                    # A thread-local adapter prevents a Playwright object created by
-                    # the UI executor from being reused by another worker thread.
-                    adapter = _flow_thread_adapter()
                 else:
                     adapter = _CREATIVE_ZIMAGE_ADAPTER
                 contract = adapter.run(dict(job), worker_id, account_id)
