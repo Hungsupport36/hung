@@ -15306,50 +15306,8 @@ async def _creative_flow_manual_profile_verify_async_impl(account_id):
         _creative_set_account_state(aid, "AUTH_ERROR", detail)
         return _creative_account_pool_html(), f"🔴 VERIFY PROFILE lỗi {aid}: {detail[:1000]}"
 
-async def _creative_flow_manual_profile_verify_async_impl(*args, **kwargs):
-    _result = await _creative_flow_manual_profile_verify_async_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_async_impl(*args, **kwargs)
-    try:
-        import inspect as _inspect
-        _sig = _inspect.signature(_creative_flow_manual_profile_verify_async_impl)
-        _bound = _sig.bind_partial(*args, **kwargs)
-        _account_id = (
-            _bound.arguments.get("account_id")
-            or _bound.arguments.get("account")
-            or _bound.arguments.get("account_name")
-        )
-        _profile = (
-            _bound.arguments.get("profile")
-            or _bound.arguments.get("profile_path")
-            or _bound.arguments.get("session_profile")
-        )
-        _worker = _bound.arguments.get("worker_id")
-        _ok = bool(_result)
-        if isinstance(_result, dict):
-            _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
-            _account_id = _account_id or _result.get("account_id")
-            _profile = _profile or _result.get("profile_path")
-            _worker = _worker or _result.get("worker_id")
-        elif isinstance(_result, (tuple, list)):
-            _ok = bool(_result[0]) if _result else False
-        if _ok:
-            _creative_activate_verified_flow_account(
-                account_id=_account_id,
-                profile_path=_profile,
-                worker_id=_worker,
-            )
-    except Exception as _exc:
-        try:
-            workflow_cmd_log(
-                "FLOW",
-                "PROFILE_VERIFY_WRAPPER_ERROR",
-                error=str(_exc)[:500],
-            )
-        except Exception:
-            pass
-    return _result
-
 async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
-    _result = await _creative_flow_manual_profile_verify_async_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_async_impl(*args, **kwargs)
+    _result = await _creative_flow_manual_profile_verify_async_impl(*args, **kwargs)
     try:
         import inspect as _inspect
         _sig = _inspect.signature(_creative_flow_manual_profile_verify_async_impl)
@@ -15389,56 +15347,13 @@ async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
         except Exception:
             pass
     return _result
-
 
 async def _creative_flow_manual_profile_verify_impl(account_id):
-    """UI callback; VERIFY itself uses Playwright Async API only."""
+    """Stable UI-facing implementation; delegates to the real async verifier."""
     return await _creative_flow_manual_profile_verify_async(account_id)
 
-async def _creative_flow_manual_profile_verify_impl(*args, **kwargs):
-    _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_impl(*args, **kwargs)
-    try:
-        import inspect as _inspect
-        _sig = _inspect.signature(_creative_flow_manual_profile_verify_impl)
-        _bound = _sig.bind_partial(*args, **kwargs)
-        _account_id = (
-            _bound.arguments.get("account_id")
-            or _bound.arguments.get("account")
-            or _bound.arguments.get("account_name")
-        )
-        _profile = (
-            _bound.arguments.get("profile")
-            or _bound.arguments.get("profile_path")
-            or _bound.arguments.get("session_profile")
-        )
-        _worker = _bound.arguments.get("worker_id")
-        _ok = bool(_result)
-        if isinstance(_result, dict):
-            _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
-            _account_id = _account_id or _result.get("account_id")
-            _profile = _profile or _result.get("profile_path")
-            _worker = _worker or _result.get("worker_id")
-        elif isinstance(_result, (tuple, list)):
-            _ok = bool(_result[0]) if _result else False
-        if _ok:
-            _creative_activate_verified_flow_account(
-                account_id=_account_id,
-                profile_path=_profile,
-                worker_id=_worker,
-            )
-    except Exception as _exc:
-        try:
-            workflow_cmd_log(
-                "FLOW",
-                "PROFILE_VERIFY_WRAPPER_ERROR",
-                error=str(_exc)[:500],
-            )
-        except Exception:
-            pass
-    return _result
-
 async def _creative_flow_manual_profile_verify(*args, **kwargs):
-    _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_impl(*args, **kwargs)
+    _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs)
     try:
         import inspect as _inspect
         _sig = _inspect.signature(_creative_flow_manual_profile_verify_impl)
