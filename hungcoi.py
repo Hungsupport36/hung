@@ -19943,105 +19943,181 @@ def _flow_generation_started(page, before_img_count=0):
 
 
 def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
-    """Click only Flow's scene-generation control, then verify submission."""
-    box = prompt_box
-    if box is None:
-        box = _flow_find_prompt_box(page, 10)
+    """Submit the current Flow scene through the real composer control.
 
-    def click_labeled(loc):
+    Priority is deliberately strict:
+      1) exact accessible Generate/Create/Run control;
+      2) the same control inside the prompt composer;
+      3) an unlabeled icon button in that composer, using geometry + SVG/tooltip
+         evidence and rejecting upload/menu/settings/destructive controls;
+      4) keyboard submit only when Flow visibly enters a generation state.
+
+    Never click an arbitrary page button.
+    """
+    box = prompt_box or _flow_find_prompt_box(page, 10)
+
+    def _visible_enabled(loc):
         try:
             for i in range(loc.count() - 1, -1, -1):
-                btn = loc.nth(i)
-                if not btn.is_visible() or not btn.is_enabled():
-                    continue
-                btn.scroll_into_view_if_needed()
-                btn.click(timeout=5000)
-                return True
+                b = loc.nth(i)
+                if b.is_visible() and b.is_enabled():
+                    return b
         except Exception:
             pass
-        return False
+        return None
 
-    # Exact accessible names.
+    def _label(btn):
+        vals = []
+        for name in ("aria-label", "title", "data-testid", "data-test-id",
+                     "data-tooltip", "data-tooltip-content", "name"):
+            try:
+                v = btn.get_attribute(name)
+                if v:
+                    vals.append(str(v))
+            except Exception:
+                pass
+        try:
+            vals.append(btn.inner_text(timeout=200) or "")
+        except Exception:
+            pass
+        return " ".join(vals).strip()
+
+    def _safe_click(btn, tag):
+        try:
+            if not btn or not btn.is_visible() or not btn.is_enabled():
+                return False
+            btn.scroll_into_view_if_needed()
+            btn.click(timeout=5000)
+            workflow_cmd_log("FLOW", "GENERATE_CONTROL_CLICKED",
+                             method=tag, label=_label(btn)[:300])
+            return True
+        except Exception as exc:
+            workflow_cmd_log("FLOW", "GENERATE_CONTROL_CLICK_FAILED",
+                             method=tag, error=str(exc)[:500], level="DEBUG")
+            return False
+
     for pat in (
         r"^Generate Image$", r"^Generate images?$", r"^Generate$",
         r"^Create Image$", r"^Create images?$", r"^Create$",
-        r"^Run$", r"^Tạo ảnh$", r"^Tạo hình$", r"^Tạo$",
+        r"^Run$", r"^Submit$", r"^Send$",
+        r"^Tạo ảnh$", r"^Tạo hình$", r"^Tạo$",
     ):
         try:
-            if click_labeled(page.get_by_role("button", name=re.compile(pat, re.I))):
+            btn = _visible_enabled(page.get_by_role("button", name=re.compile(pat, re.I)))
+            if _safe_click(btn, "exact-accessible"):
                 return True
         except Exception:
             pass
 
-    # Icon-only / data-testid controls. The label must itself indicate creation.
-    selectors = (
-        "button[aria-label*='generate' i]",
-        "button[aria-label*='create image' i]",
-        "button[aria-label*='create images' i]",
-        "button[title*='generate' i]",
-        "button[title*='create image' i]",
-        "[role='button'][aria-label*='generate' i]",
-        "[role='button'][data-testid*='generate' i]",
-        "[role='button'][data-testid*='submit' i]",
-        "[role='button'][data-tooltip*='generate' i]",
-        "[role='button'][data-tooltip-content*='generate' i]",
-    )
-    for sel in selectors:
-        try:
-            if click_labeled(page.locator(sel)):
-                return True
-        except Exception:
-            pass
-
-    # Composer-local control. We inspect attributes/text and explicitly reject
-    # upload, project, menu, navigation and destructive controls.
+    composer_roots = []
     try:
-        composer = box.locator(
+        root = box.locator(
             "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
         )
-        controls = composer.locator("button,[role='button']")
-        for i in range(controls.count() - 1, -1, -1):
-            btn = controls.nth(i)
-            try:
+        composer_roots.append(root)
+        composer_roots.append(
+            root.locator("xpath=ancestor::*[.//button or .//*[@role='button']][1]")
+        )
+    except Exception:
+        pass
+
+    submit_re = re.compile(
+        r"generate|create\s*(?:image|images|video)?|submit|run|send|tạo\s*(?:ảnh|hình)?",
+        re.I,
+    )
+    reject_re = re.compile(
+        r"project|new|upload|attach|reference|settings|menu|more|"
+        r"delete|remove|cancel|close|back|download|undo|redo",
+        re.I,
+    )
+
+    for root in composer_roots:
+        try:
+            controls = root.locator("button,[role='button']")
+            for i in range(controls.count() - 1, -1, -1):
+                btn = controls.nth(i)
                 if not btn.is_visible() or not btn.is_enabled():
                     continue
-                label = " ".join(filter(None, (
-                    btn.get_attribute("aria-label"),
-                    btn.get_attribute("title"),
-                    btn.get_attribute("data-testid"),
-                    btn.get_attribute("data-tooltip"),
-                    btn.get_attribute("data-tooltip-content"),
-                    btn.inner_text(timeout=250),
-                )))
-                if re.search(
-                    r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?",
-                    label, re.I
-                ) and not re.search(
-                    r"project|new|upload|attach|settings|menu|more|delete|cancel|close",
-                    label, re.I
-                ):
-                    btn.scroll_into_view_if_needed()
-                    btn.click(timeout=5000)
-                    return True
+                lab = _label(btn)
+                if submit_re.search(lab) and not reject_re.search(lab):
+                    if _safe_click(btn, "composer-labeled"):
+                        return True
+        except Exception:
+            continue
+
+    try:
+        bb = box.bounding_box()
+    except Exception:
+        bb = None
+
+    if bb:
+        bx, by, bw, bh = bb
+        box_right = bx + bw
+        box_bottom = by + bh
+        for root in composer_roots:
+            try:
+                controls = root.locator("button,[role='button']")
+                candidates = []
+                for i in range(controls.count() - 1, -1, -1):
+                    btn = controls.nth(i)
+                    try:
+                        if not btn.is_visible() or not btn.is_enabled():
+                            continue
+                        lab = _label(btn)
+                        if reject_re.search(lab):
+                            continue
+                        cb = btn.bounding_box()
+                        if not cb:
+                            continue
+                        cx, cy, cw, ch = cb
+                        near = (
+                            cx >= bx - max(80, bw * 0.10)
+                            and cx <= box_right + 120
+                            and cy >= by - 100
+                            and cy <= box_bottom + 140
+                        )
+                        if not near:
+                            continue
+                        try:
+                            html_fragment = btn.inner_html(timeout=250)
+                        except Exception:
+                            html_fragment = ""
+                        has_svg = "<svg" in (html_fragment or "").lower()
+                        has_path = "<path" in (html_fragment or "").lower()
+                        if not has_svg:
+                            continue
+                        score = 2 + (1 if has_path else 0)
+                        score += int(max(0, cx - bx) / max(1, bw) * 3)
+                        score += int(max(0, cy - by) / max(1, bh) * 2)
+                        candidates.append((score, cx, cy, btn))
+                    except Exception:
+                        continue
+
+                candidates.sort(key=lambda x: (x[0], x[1], x[2]), reverse=True)
+                for score, _cx, _cy, btn in candidates:
+                    if _safe_click(btn, f"composer-icon-score-{score}"):
+                        deadline = time.monotonic() + 8
+                        while time.monotonic() < deadline:
+                            if _flow_generation_started(page, before_img_count):
+                                return True
+                            time.sleep(0.2)
             except Exception:
                 continue
-    except Exception:
-        pass
 
-    # Keyboard fallback is allowed only after focusing the actual composer and
-    # only when Flow visibly enters a generating state.
-    try:
-        box.click(timeout=3000)
-        box.press("Control+Enter")
-        deadline = time.monotonic() + 8
-        while time.monotonic() < deadline:
-            if _flow_generation_started(page, before_img_count):
-                return True
-            time.sleep(0.25)
-    except Exception:
-        pass
+    for key in ("Control+Enter", "Enter"):
+        try:
+            box.click(timeout=3000)
+            box.press(key)
+            deadline = time.monotonic() + 8
+            while time.monotonic() < deadline:
+                if _flow_generation_started(page, before_img_count):
+                    workflow_cmd_log("FLOW", "GENERATE_KEYBOARD_ACCEPTED", key=key)
+                    return True
+                time.sleep(0.2)
+        except Exception:
+            continue
+
     return False
-
 
 def _flow_download_latest_asset(page,before_img_count,timeout=900):
     """Wait for the generated asset and click Flow's visible Download control."""
