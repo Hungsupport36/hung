@@ -19776,201 +19776,132 @@ def _flow_thread_context(self, account_id):
 GoogleFlowAdapter._context = _flow_thread_context
 
 def _flow_prompt_box_visible(page):
-    """Return True only when Flow's actual scene composer is visible."""
-    selectors = ("textarea", "[contenteditable='true']")
+    """Detect the real Flow scene composer across current/legacy UI builds."""
+    selectors=("textarea","[contenteditable='true']","[role='textbox']","input[type='text']")
+    words=("prompt","describe","image","what do you want","enter a prompt","type a prompt","mô tả","nhập","describe your scene","tell flow")
     for sel in selectors:
         try:
-            loc = page.locator(sel)
-            for i in range(loc.count() - 1, -1, -1):
-                el = loc.nth(i)
-                if not el.is_visible() or not el.is_enabled():
-                    continue
-                attrs = []
-                for name in ("placeholder", "aria-label", "data-placeholder", "name", "data-testid"):
+            loc=page.locator(sel)
+            for i in range(loc.count()-1,-1,-1):
+                el=loc.nth(i)
+                if not el.is_visible() or not el.is_enabled(): continue
+                attrs=[]
+                for name in ("placeholder","aria-label","data-placeholder","name","data-testid","data-test-id","title"):
                     try:
-                        v = el.get_attribute(name)
-                        if v:
-                            attrs.append(str(v))
-                    except Exception:
-                        pass
-                label = " ".join(attrs).lower()
-                if any(k in label for k in (
-                    "prompt", "describe", "image", "what do you want",
-                    "enter a prompt", "type a prompt", "mô tả", "nhập"
-                )):
-                    return True
-                # Flow's composer is normally a textarea/contenteditable; only
-                # accept an unlabeled control when it has a nearby generation
-                # control. This avoids mistaking account/search/navigation boxes.
+                        v=el.get_attribute(name)
+                        if v: attrs.append(str(v))
+                    except Exception: pass
+                label=" ".join(attrs).lower()
+                if any(k in label for k in words): return True
                 try:
-                    parent = el.locator(
-                        "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
-                    )
-                    controls = parent.locator("button,[role='button']")
-                    for j in range(controls.count() - 1, -1, -1):
-                        c = controls.nth(j)
-                        if not c.is_visible() or not c.is_enabled():
-                            continue
-                        lab = " ".join(filter(None, (
-                            c.get_attribute("aria-label"),
-                            c.get_attribute("title"),
-                            c.get_attribute("data-testid"),
-                            c.get_attribute("data-tooltip"),
-                            c.get_attribute("data-tooltip-content"),
-                            c.inner_text(timeout=150),
-                        )))
-                        if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?", lab, re.I):
-                            return True
-                except Exception:
-                    pass
-        except Exception:
-            continue
+                    parent=el.locator("xpath=ancestor::*[.//button or .//*[@role='button']][1]")
+                    controls=parent.locator("button,[role='button']")
+                    labels=[]
+                    for j in range(controls.count()-1,-1,-1):
+                        ctl=controls.nth(j)
+                        if not ctl.is_visible() or not ctl.is_enabled(): continue
+                        labels.append(" ".join(filter(None,(ctl.get_attribute("aria-label"),ctl.get_attribute("title"),ctl.get_attribute("data-testid"),ctl.get_attribute("data-tooltip"),ctl.get_attribute("data-tooltip-content"),ctl.inner_text(timeout=150)))))
+                    if any(re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?",x or "",re.I) for x in labels): return True
+                except Exception: pass
+        except Exception: continue
     return False
 
-
 def _flow_create_project(page, timeout=60):
-    """Reproduce the old Creative Studio sequence: project -> prompt composer."""
-    deadline = time.monotonic() + max(15, int(timeout))
+    """Open/reuse a Flow project and stop only when the real composer is ready."""
+    timeout=max(15,int(timeout)); deadline=time.monotonic()+timeout
+    workflow_cmd_log("FLOW","PROJECT_STAGE_START",url=str(page.url or "")[:500],timeout=timeout)
+    if re.search(r"/project(?:/|$)",str(page.url or ""),re.I):
+        workflow_cmd_log("FLOW","PROJECT_ROUTE_DETECTED",url=str(page.url or "")[:500])
+        while time.monotonic()<deadline:
+            if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+            if _flow_prompt_box_visible(page):
+                workflow_cmd_log("FLOW","PROJECT_READY",url=str(page.url or "")[:500]); return
+            time.sleep(.5)
     if _flow_prompt_box_visible(page):
-        workflow_cmd_log("FLOW", "PROJECT_ALREADY_OPEN")
-        return
-
-    # First prefer the real project/create controls exposed by Flow.
-    project_patterns = (
-        r"^New project$", r"^Create new project$", r"^Create project$",
-        r"^New$", r"^Tạo dự án$", r"^Tạo mới$", r"^Create new$",
-    )
-    while time.monotonic() < deadline:
-        if _flow_page_has_captcha(page):
-            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
-
-        clicked = False
-        for pat in project_patterns:
+        workflow_cmd_log("FLOW","PROJECT_ALREADY_OPEN",url=str(page.url or "")[:500]); return
+    patterns=(r"^New project$",r"^Create new project$",r"^Create project$",r"^New$",r"^Tạo dự án$",r"^Tạo mới$",r"^Create new$",r"^Start new project$")
+    while time.monotonic()<deadline:
+        if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+        clicked=False
+        for pat in patterns:
             try:
-                loc = page.get_by_role("button", name=re.compile(pat, re.I))
-                for i in range(loc.count() - 1, -1, -1):
-                    btn = loc.nth(i)
+                loc=page.get_by_role("button",name=re.compile(pat,re.I))
+                for i in range(loc.count()-1,-1,-1):
+                    btn=loc.nth(i)
                     if btn.is_visible() and btn.is_enabled():
-                        btn.scroll_into_view_if_needed()
-                        btn.click(timeout=5000)
-                        workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED", label=pat)
-                        clicked = True
-                        break
-                if clicked:
-                    break
-            except Exception:
-                pass
-
-        # Some builds render the project action as a link/menu item rather than
-        # a button. Use exact visible text only; never click a generic last button.
+                        btn.scroll_into_view_if_needed(); btn.click(timeout=5000)
+                        workflow_cmd_log("FLOW","CREATE_PROJECT_CLICKED",label=pat); clicked=True; break
+                if clicked: break
+            except Exception: pass
         if not clicked:
-            for pat in project_patterns:
+            for pat in patterns:
                 try:
-                    loc = page.get_by_text(re.compile(pat, re.I))
-                    for i in range(loc.count() - 1, -1, -1):
-                        item = loc.nth(i)
+                    loc=page.get_by_text(re.compile(pat,re.I))
+                    for i in range(loc.count()-1,-1,-1):
+                        item=loc.nth(i)
                         if item.is_visible() and item.is_enabled():
                             item.click(timeout=5000)
-                            workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED_TEXT", label=pat)
-                            clicked = True
-                            break
-                    if clicked:
-                        break
-                except Exception:
-                    pass
-
+                            workflow_cmd_log("FLOW","CREATE_PROJECT_CLICKED_TEXT",label=pat); clicked=True; break
+                    if clicked: break
+                except Exception: pass
         if clicked:
-            workflow_cmd_log("FLOW", "CREATE_PROJECT_DIALOG_WAIT")
-            # Confirm only a project-creation dialog, not arbitrary "Create".
-            for _ in range(30):
-                if _flow_page_has_captcha(page):
-                    raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
-                for pat in (r"^Create project$", r"^Create$", r"^Continue$", r"^Tạo$", r"^Tiếp tục$"):
-                    try:
-                        dialogs = page.get_by_role("dialog")
-                        targets = dialogs.get_by_role("button", name=re.compile(pat, re.I)) if dialogs.count() else page.get_by_role("button", name=re.compile(pat, re.I))
-                        for i in range(targets.count() - 1, -1, -1):
-                            btn = targets.nth(i)
-                            if btn.is_visible() and btn.is_enabled():
-                                btn.click(timeout=3000)
-                                workflow_cmd_log("FLOW", "CREATE_PROJECT_CONFIRMED", label=pat)
-                                break
-                    except Exception:
-                        pass
+            workflow_cmd_log("FLOW","CREATE_PROJECT_DIALOG_WAIT")
+            dialog_deadline=min(deadline,time.monotonic()+20)
+            while time.monotonic()<dialog_deadline:
+                if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
                 if _flow_prompt_box_visible(page):
-                    workflow_cmd_log("FLOW", "PROJECT_READY")
-                    return
-                time.sleep(0.5)
-        time.sleep(0.5)
-
-    raise CreativeFlowUnavailable(
-        "Không mở/tạo được Project Google Flow hoặc chưa xuất hiện Scene Prompt composer."
-    )
-
+                    workflow_cmd_log("FLOW","PROJECT_READY",url=str(page.url or "")[:500]); return
+                for pat in (r"^Create project$",r"^Create$",r"^Continue$",r"^Tạo$",r"^Tiếp tục$"):
+                    try:
+                        dialogs=page.get_by_role("dialog")
+                        targets=dialogs.get_by_role("button",name=re.compile(pat,re.I)) if dialogs.count() else page.get_by_role("button",name=re.compile(pat,re.I))
+                        for i in range(targets.count()-1,-1,-1):
+                            btn=targets.nth(i)
+                            if btn.is_visible() and btn.is_enabled():
+                                btn.click(timeout=3000); workflow_cmd_log("FLOW","CREATE_PROJECT_CONFIRMED",label=pat); break
+                    except Exception: pass
+                if _flow_prompt_box_visible(page):
+                    workflow_cmd_log("FLOW","PROJECT_READY",url=str(page.url or "")[:500]); return
+                time.sleep(.4)
+        workflow_cmd_log("FLOW","PROJECT_STAGE_WAIT",url=str(page.url or "")[:500],remaining_seconds=max(0,int(deadline-time.monotonic())),level="DEBUG")
+        time.sleep(.5)
+    raise CreativeFlowUnavailable("Không mở/tạo được Project Google Flow hoặc chưa xuất hiện Scene Prompt composer.")
 
 def _flow_find_prompt_box(page, timeout=45):
-    _flow_create_project(page, timeout=max(20, int(timeout)))
-    deadline = time.monotonic() + max(10, int(timeout))
-    selectors = ("textarea", "[contenteditable='true']")
-    while time.monotonic() < deadline:
-        if _flow_page_has_captcha(page):
-            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+    """Return the actual Flow scene composer after project creation/reuse."""
+    _flow_create_project(page,timeout=max(20,int(timeout)))
+    deadline=time.monotonic()+max(10,int(timeout))
+    selectors=("textarea","[contenteditable='true']","[role='textbox']","input[type='text']")
+    while time.monotonic()<deadline:
+        if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
         for sel in selectors:
             try:
-                loc = page.locator(sel)
-                for i in range(loc.count() - 1, -1, -1):
-                    item = loc.nth(i)
-                    if not item.is_visible() or not item.is_enabled():
-                        continue
-                    attrs = []
-                    for name in ("placeholder", "aria-label", "data-placeholder", "name", "data-testid"):
+                loc=page.locator(sel)
+                for i in range(loc.count()-1,-1,-1):
+                    item=loc.nth(i)
+                    if not item.is_visible() or not item.is_enabled(): continue
+                    attrs=[]
+                    for name in ("placeholder","aria-label","data-placeholder","name","data-testid","data-test-id","title"):
                         try:
-                            v = item.get_attribute(name)
-                            if v:
-                                attrs.append(str(v))
-                        except Exception:
-                            pass
-                    label = " ".join(attrs).lower()
-                    if any(k in label for k in (
-                        "prompt", "describe", "image", "what do you want",
-                        "enter a prompt", "type a prompt", "mô tả", "nhập"
-                    )):
-                        return item
-                    # If unlabeled, accept only when its composer has a generate
-                    # control. This is the important guard against search fields.
+                            v=item.get_attribute(name)
+                            if v: attrs.append(str(v))
+                        except Exception: pass
+                    label=" ".join(attrs).lower()
+                    if any(k in label for k in ("prompt","describe","image","what do you want","enter a prompt","type a prompt","mô tả","nhập","describe your scene","tell flow")): return item
                     try:
-                        parent = item.locator(
-                            "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
-                        )
-                        controls = parent.locator("button,[role='button']")
-                        for j in range(controls.count() - 1, -1, -1):
-                            c = controls.nth(j)
-                            if not c.is_visible() or not c.is_enabled():
-                                continue
-                            lab = " ".join(filter(None, (
-                                c.get_attribute("aria-label"),
-                                c.get_attribute("title"),
-                                c.get_attribute("data-testid"),
-                                c.get_attribute("data-tooltip"),
-                                c.get_attribute("data-tooltip-content"),
-                                c.inner_text(timeout=150),
-                            )))
-                            if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?", lab, re.I):
-                                return item
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-        time.sleep(0.4)
-    try:
-        body = (page.locator("body").inner_text(timeout=2000) or "")[:1600]
-    except Exception:
-        body = ""
-    raise CreativeFlowUnavailable(
-        f"Không tìm thấy Scene Prompt composer sau {timeout}s · "
-        f"url={str(page.url or '')[:300]} · body={body!r}"
-    )
-
+                        parent=item.locator("xpath=ancestor::*[.//button or .//*[@role='button']][1]")
+                        controls=parent.locator("button,[role='button']")
+                        for j in range(controls.count()-1,-1,-1):
+                            c=controls.nth(j)
+                            if not c.is_visible() or not c.is_enabled(): continue
+                            lab=" ".join(filter(None,(c.get_attribute("aria-label"),c.get_attribute("title"),c.get_attribute("data-testid"),c.get_attribute("data-tooltip"),c.get_attribute("data-tooltip-content"),c.inner_text(timeout=150))))
+                            if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?",lab,re.I) and not re.search(r"project|new|upload|attach|settings|menu|more|delete|cancel|close",lab,re.I): return item
+                    except Exception: pass
+            except Exception: pass
+        time.sleep(.35)
+    try: body=(page.locator("body").inner_text(timeout=2000) or "")[:2200]
+    except Exception: body=""
+    raise CreativeFlowUnavailable(f"Không tìm thấy Scene Prompt composer sau {timeout}s · url={str(page.url or '')[:300]} · body={body!r}")
 
 def _flow_generation_started(page, before_img_count=0):
     """Best-effort evidence that Flow accepted the submit."""
