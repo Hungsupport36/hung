@@ -14938,7 +14938,12 @@ def _flow_context_registered_profile(self, account_id):
             page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
         except Exception:
             pass
-    return pw, browser, page
+    # Register the attached context so VERIFY/health_check can see the
+    # exact browser session that was just connected. The previous V11 code
+    # returned the tuple but forgot to put it into _contexts, so health_check()
+    # always reported "Session chưa mở." immediately after manual login.
+    self._contexts[account_id] = (pw, browser, page)
+    return self._contexts[account_id]
 
 GoogleFlowAdapter._context = _flow_context_registered_profile
 
