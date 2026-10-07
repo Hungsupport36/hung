@@ -1,16 +1,17 @@
-name: V11.5.4 Flow Playwright runtime patch
+name: V11.6 Flow runtime sanity check
 
 on:
   push:
     branches: [fix/creative-studio-v7]
     paths:
       - ".github/workflows/flow_worker_patch.yml"
+      - "hungcoi.py"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  patch:
+  verify:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,103 +19,27 @@ jobs:
           ref: fix/creative-studio-v7
           fetch-depth: 1
 
-      - name: Patch Flow Playwright runtime
+      - name: Verify canonical Flow runtime
         shell: python
         run: |
           from pathlib import Path
+          import ast
 
           p = Path("hungcoi.py")
           s = p.read_text(encoding="utf-8")
 
-          helper = r'''
-def _vhung_playwright_driver():
-    """Return the Playwright Node driver used by the proven Windows runtime.
+          required = [
+              "def _playwright_runtime_candidates():",
+              "def _playwright_prepare_runtime():",
+              "def _flow_thread_context(self, account_id):",
+              "def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):",
+              "_flow_click_generate_image(page, box, before_img_count)",
+              'count=max(1, int(os.getenv("VHUNG_CREATIVE_FLOW_WORKERS","1") or 1))',
+          ]
+          missing = [x for x in required if x not in s]
+          if missing:
+              raise SystemExit("Missing V11.6 Flow runtime markers: " + repr(missing))
 
-    Priority:
-      1. VHUNG_PLAYWRIGHT_DRIVER_ROOT\node.exe + package\cli.js
-      2. tool/playwright/driver
-      3. bundled playwright/driver
-      4. the user's existing CloneVoice 1.1.18 runtime
-    """
-    candidates = []
-    env_root = str(os.getenv("VHUNG_PLAYWRIGHT_DRIVER_ROOT") or "").strip()
-    if env_root:
-        candidates.append(Path(env_root).expanduser())
-    candidates.extend([
-        BASE / "tool" / "playwright" / "driver",
-        BASE / "playwright" / "driver",
-        Path(r"C:\Users\hungcoi\Downloads\CloneVoice-1.1.18-win64\CloneVoice-1.1.18-win64\playwright\driver"),
-    ])
-    for root in candidates:
-        root = root.resolve()
-        node = root / "node.exe"
-        cli = root / "package" / "cli.js"
-        if node.is_file() and cli.is_file():
-            return str(node), str(cli), root
-    return None, None, None
-
-
-def _apply_vhung_playwright_driver():
-    node, cli, root = _vhung_playwright_driver()
-    if not node or not cli:
-        workflow_cmd_log(
-            "FLOW",
-            "PLAYWRIGHT_RUNTIME_FALLBACK",
-            detail="Không tìm thấy runtime Playwright ngoài; dùng driver của Python package hiện tại.",
-            level="DEBUG",
-        )
-        return False
-
-    def _compute():
-        return node, cli
-
-    try:
-        import playwright._impl._driver as _pw_driver
-        _pw_driver.compute_driver_executable = _compute
-    except Exception:
-        pass
-    try:
-        import playwright._impl._transport as _pw_transport
-        _pw_transport.compute_driver_executable = _compute
-    except Exception:
-        pass
-
-    os.environ["PLAYWRIGHT_NODEJS_PATH"] = node
-    workflow_cmd_log(
-        "FLOW",
-        "PLAYWRIGHT_RUNTIME_SELECTED",
-        driver=str(root),
-        node=node,
-        cli=cli,
-    )
-    return True
-
-'''
-
-        marker = "def _flow_thread_context(self, account_id):"
-        if marker not in s:
-            raise SystemExit("Không tìm thấy _flow_thread_context trong hungcoi.py")
-
-        if "def _apply_vhung_playwright_driver():" not in s:
-            s = s.replace(marker, helper + marker, 1)
-
-        old = "    from playwright.sync_api import sync_playwright\n"
-        new = "    _apply_vhung_playwright_driver()\n    from playwright.sync_api import sync_playwright\n"
-        if old not in s:
-            raise SystemExit("Không tìm thấy import sync_playwright trong _flow_thread_context")
-        s = s.replace(old, new, 1)
-
-        p.write_text(s, encoding="utf-8")
-
-      - name: Commit patch
-        shell: bash
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add hungcoi.py
-          if git diff --cached --quiet; then
-            echo "No changes"
-            exit 0
-          fi
-          git commit -m "V11.5.4: use proven CloneVoice Playwright driver"
-          git push origin HEAD:fix/creative-studio-v7
+          # Syntax validation only. Do not mutate production code from CI.
+          ast.parse(s, filename="hungcoi.py")
+          print("V11.6 FLOW RUNTIME SANITY OK")
