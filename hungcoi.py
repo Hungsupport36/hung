@@ -19865,65 +19865,175 @@ def _flow_prompt_box_visible(page):
     return False
 
 def _flow_create_project(page, timeout=60):
-    """Open/reuse a Flow project and stop only when the real composer is ready."""
-    timeout=max(15,int(timeout)); deadline=time.monotonic()+timeout
-    workflow_cmd_log("FLOW","PROJECT_STAGE_START",url=str(page.url or "")[:500],timeout=timeout)
-    if re.search(r"/project(?:/|$)",str(page.url or ""),re.I):
-        workflow_cmd_log("FLOW","PROJECT_ROUTE_DETECTED",url=str(page.url or "")[:500])
-        while time.monotonic()<deadline:
-            if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
-            if _flow_prompt_box_visible(page):
-                workflow_cmd_log("FLOW","PROJECT_READY",url=str(page.url or "")[:500]); return
-            time.sleep(.5)
-    if _flow_prompt_box_visible(page):
-        workflow_cmd_log("FLOW","PROJECT_ALREADY_OPEN",url=str(page.url or "")[:500]); return
-    patterns=(r"^New project$",r"^Create new project$",r"^Create project$",r"^New$",r"^Tạo dự án$",r"^Tạo mới$",r"^Create new$",r"^Start new project$")
-    while time.monotonic()<deadline:
-        if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
-        clicked=False
-        for pat in patterns:
+    """Create/reuse a real Google Flow project and wait for the scene composer.
+
+    Current Flow desktop uses "+ New project". Older builds used New/Create
+    project variants. Resolve the real clickable control first, then verify
+    that the prompt composer is actually visible before returning.
+    """
+    timeout = max(15, int(timeout))
+    deadline = time.monotonic() + timeout
+    url_now = str(page.url or "")
+    workflow_cmd_log("FLOW", "PROJECT_STAGE_START", url=url_now[:500], timeout=timeout)
+
+    def _ready():
+        try:
+            return _flow_prompt_box_visible(page)
+        except Exception:
+            return False
+
+    if _ready():
+        workflow_cmd_log("FLOW", "PROJECT_ALREADY_OPEN", url=str(page.url or "")[:500])
+        return
+
+    create_patterns = (
+        r"^\\+\\s*New project$",
+        r"^New project$",
+        r"^Create new project$",
+        r"^Create project$",
+        r"^New$",
+        r"^Tạo dự án$",
+        r"^Tạo mới$",
+        r"^Create new$",
+        r"^Start new project$",
+    )
+
+    def _click_create_control():
+        # 1. Exact accessible button/name.
+        for pat in create_patterns:
             try:
-                loc=page.get_by_role("button",name=re.compile(pat,re.I))
-                for i in range(loc.count()-1,-1,-1):
-                    btn=loc.nth(i)
-                    if btn.is_visible() and btn.is_enabled():
-                        btn.scroll_into_view_if_needed(); btn.click(timeout=5000)
-                        workflow_cmd_log("FLOW","CREATE_PROJECT_CLICKED",label=pat); clicked=True; break
-                if clicked: break
-            except Exception: pass
-        if not clicked:
-            for pat in patterns:
-                try:
-                    loc=page.get_by_text(re.compile(pat,re.I))
-                    for i in range(loc.count()-1,-1,-1):
-                        item=loc.nth(i)
-                        if item.is_visible() and item.is_enabled():
-                            item.click(timeout=5000)
-                            workflow_cmd_log("FLOW","CREATE_PROJECT_CLICKED_TEXT",label=pat); clicked=True; break
-                    if clicked: break
-                except Exception: pass
+                loc = page.get_by_role("button", name=re.compile(pat, re.I))
+                for n in range(loc.count() - 1, -1, -1):
+                    b = loc.nth(n)
+                    if b.is_visible() and b.is_enabled():
+                        b.scroll_into_view_if_needed()
+                        b.click(timeout=5000)
+                        workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED", label=pat)
+                        return True
+            except Exception:
+                pass
+
+        # 2. Current Flow may expose the "+ New project" text on a clickable
+        #    wrapper rather than the button's accessible name.
+        text_patterns = (
+            r"\\+\\s*New project",
+            r"New project",
+            r"Tạo dự án",
+            r"Tạo mới",
+        )
+        for pat in text_patterns:
+            try:
+                loc = page.get_by_text(re.compile(pat, re.I))
+                for n in range(loc.count() - 1, -1, -1):
+                    item = loc.nth(n)
+                    if not item.is_visible():
+                        continue
+                    # Prefer the nearest clickable ancestor.
+                    candidates = [
+                        item,
+                        item.locator("xpath=ancestor::*[@role='button'][1]"),
+                        item.locator("xpath=ancestor::button[1]"),
+                        item.locator("xpath=ancestor::*[self::a or @role='link'][1]"),
+                    ]
+                    for c in candidates:
+                        try:
+                            if c.count() and c.first.is_visible() and c.first.is_enabled():
+                                c.first.scroll_into_view_if_needed()
+                                c.first.click(timeout=5000)
+                                workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED_TEXT", label=pat)
+                                return True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        # 3. Data/tooltip/test-id fallback for the current Flow shell.
+        try:
+            loc = page.locator(
+                "[aria-label*='new project' i],"
+                "[title*='new project' i],"
+                "[data-testid*='new-project' i],"
+                "[data-testid*='new_project' i],"
+                "[data-test-id*='new-project' i]"
+            )
+            for n in range(loc.count() - 1, -1, -1):
+                b = loc.nth(n)
+                if b.is_visible() and b.is_enabled():
+                    b.scroll_into_view_if_needed()
+                    b.click(timeout=5000)
+                    workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED_ATTR")
+                    return True
+        except Exception:
+            pass
+        return False
+
+    while time.monotonic() < deadline:
+        if _flow_page_has_captcha(page):
+            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+
+        if _ready():
+            workflow_cmd_log("FLOW", "PROJECT_READY", url=str(page.url or "")[:500])
+            return
+
+        clicked = _click_create_control()
         if clicked:
-            workflow_cmd_log("FLOW","CREATE_PROJECT_DIALOG_WAIT")
-            dialog_deadline=min(deadline,time.monotonic()+20)
-            while time.monotonic()<dialog_deadline:
-                if _flow_page_has_captcha(page): raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
-                if _flow_prompt_box_visible(page):
-                    workflow_cmd_log("FLOW","PROJECT_READY",url=str(page.url or "")[:500]); return
-                for pat in (r"^Create project$",r"^Create$",r"^Continue$",r"^Tạo$",r"^Tiếp tục$"):
+            workflow_cmd_log("FLOW", "CREATE_PROJECT_WAIT")
+
+            # Some Flow builds navigate directly; others show a small creation
+            # surface first. Never click arbitrary buttons: only accept a
+            # composer or an explicitly named project-confirmation control.
+            wait_deadline = min(deadline, time.monotonic() + 20)
+            while time.monotonic() < wait_deadline:
+                if _flow_page_has_captcha(page):
+                    raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+                if _ready():
+                    workflow_cmd_log("FLOW", "PROJECT_READY", url=str(page.url or "")[:500])
+                    return
+
+                for pat in (
+                    r"^Create project$",
+                    r"^Create$",
+                    r"^Continue$",
+                    r"^Tạo$",
+                    r"^Tiếp tục$",
+                ):
                     try:
-                        dialogs=page.get_by_role("dialog")
-                        targets=dialogs.get_by_role("button",name=re.compile(pat,re.I)) if dialogs.count() else page.get_by_role("button",name=re.compile(pat,re.I))
-                        for i in range(targets.count()-1,-1,-1):
-                            btn=targets.nth(i)
-                            if btn.is_visible() and btn.is_enabled():
-                                btn.click(timeout=3000); workflow_cmd_log("FLOW","CREATE_PROJECT_CONFIRMED",label=pat); break
-                    except Exception: pass
-                if _flow_prompt_box_visible(page):
-                    workflow_cmd_log("FLOW","PROJECT_READY",url=str(page.url or "")[:500]); return
-                time.sleep(.4)
-        workflow_cmd_log("FLOW","PROJECT_STAGE_WAIT",url=str(page.url or "")[:500],remaining_seconds=max(0,int(deadline-time.monotonic())),level="DEBUG")
-        time.sleep(.5)
-    raise CreativeFlowUnavailable("Không mở/tạo được Project Google Flow hoặc chưa xuất hiện Scene Prompt composer.")
+                        dialogs = page.get_by_role("dialog")
+                        target = (
+                            dialogs.get_by_role("button", name=re.compile(pat, re.I))
+                            if dialogs.count()
+                            else page.get_by_role("button", name=re.compile(pat, re.I))
+                        )
+                        for n in range(target.count() - 1, -1, -1):
+                            b = target.nth(n)
+                            if b.is_visible() and b.is_enabled():
+                                b.click(timeout=3000)
+                                workflow_cmd_log("FLOW", "CREATE_PROJECT_CONFIRMED", label=pat)
+                                break
+                    except Exception:
+                        pass
+
+                if _ready():
+                    workflow_cmd_log("FLOW", "PROJECT_READY", url=str(page.url or "")[:500])
+                    return
+                time.sleep(0.35)
+
+        workflow_cmd_log(
+            "FLOW", "PROJECT_STAGE_WAIT",
+            url=str(page.url or "")[:500],
+            remaining_seconds=max(0, int(deadline - time.monotonic())),
+            level="DEBUG",
+        )
+        time.sleep(0.5)
+
+    try:
+        body = (page.locator("body").inner_text(timeout=2000) or "")[:3000]
+    except Exception:
+        body = ""
+    raise CreativeFlowUnavailable(
+        f"Không mở/tạo được Project Google Flow hoặc chưa xuất hiện Scene Prompt composer. "
+        f"url={str(page.url or '')[:300]} · body={body!r}"
+    )
 
 def _flow_find_prompt_box(page, timeout=45):
     """Return the actual Flow scene composer after project creation/reuse."""
