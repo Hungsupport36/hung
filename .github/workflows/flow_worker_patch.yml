@@ -1,4 +1,4 @@
-name: V11.6.2 Flow profile activation patch
+name: V11.6.4 Repair Creative Studio verify recursion
 
 on:
   push:
@@ -10,7 +10,7 @@ permissions:
   contents: write
 
 jobs:
-  patch:
+  repair:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -18,196 +18,158 @@ jobs:
           ref: fix/creative-studio-v7
           fetch-depth: 1
 
-      - name: Patch verified Flow account state
+      - name: Repair recursive Flow profile verify wrappers
         shell: python
         run: |
           from pathlib import Path
           import ast
           import textwrap
-          import re
 
           p = Path("hungcoi.py")
           s = p.read_text(encoding="utf-8")
 
-          helper = textwrap.dedent(r'''
-          def _creative_activate_verified_flow_account(account_id=None, profile_path=None, worker_id=None):
-              """Mark a real, successfully verified Flow profile ACTIVE."""
-              try:
-                  _creative_db_init()
-                  now = _creative_now()
-                  with _batch_db() as db:
-                      aid = str(account_id or "").strip()
-                      profile = str(profile_path or "").strip()
-                      if not aid and profile:
-                          row = db.execute(
-                              "SELECT account_id FROM creative_accounts "
-                              "WHERE session_profile=? LIMIT 1",
-                              (profile,),
-                          ).fetchone()
-                          aid = str(row[0]) if row else ""
-                      if not aid and profile:
-                          aid = Path(profile).name
-                      if not aid:
-                          return False
-                      row = db.execute(
-                          "SELECT account_id FROM creative_accounts "
-                          "WHERE account_id=? OR session_profile=? LIMIT 1",
-                          (aid, profile),
-                      ).fetchone()
-                      if not row:
-                          return False
-                      aid = str(row[0])
-                      db.execute(
-                          "UPDATE creative_accounts SET "
-                          "status='ACTIVE', last_error=NULL, cooldown_until=NULL, "
-                          "last_success=?, updated_at=? WHERE account_id=?",
-                          (now, now, aid),
-                      )
-                      if worker_id:
-                          db.execute(
-                              "UPDATE creative_workers SET account_id=?, "
-                              "updated_at=? WHERE worker_id=?",
-                              (aid, now, str(worker_id)),
-                          )
-                  workflow_cmd_log(
-                      "FLOW",
-                      "PROFILE_VERIFIED_ACTIVE",
-                      account_id=aid,
-                      profile=profile,
-                      worker_id=str(worker_id or ""),
-                  )
-                  return True
-              except Exception as exc:
-                  try:
-                      workflow_cmd_log(
-                          "FLOW",
-                          "PROFILE_ACTIVE_UPDATE_FAILED",
-                          error=str(exc)[:500],
-                          account_id=str(account_id or ""),
-                      )
-                  except Exception:
-                      pass
-                  return False
-          ''').lstrip()
-
-          if "def _creative_activate_verified_flow_account(" not in s:
-              marker = "\ndef _creative_create_jobs("
-              if marker not in s:
-                  raise SystemExit("Creative Studio insertion point not found")
-              s = s.replace(marker, "\n" + helper + marker, 1)
-
           tree = ast.parse(s, filename="hungcoi.py")
           lines = s.splitlines(keepends=True)
 
-          targets = []
-          for node in ast.walk(tree):
-              if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                  continue
-              if node.name not in (
-                  "_creative_flow_manual_profile_verify_async",
-                  "_creative_flow_manual_profile_verify",
-              ):
-                  continue
-              targets.append(node)
+          # Keep the FIRST real async implementation. The broken patch created
+          # duplicate *_impl definitions whose bodies call themselves forever.
+          impl_nodes = [
+              n for n in ast.walk(tree)
+              if isinstance(n, ast.AsyncFunctionDef)
+              and n.name == "_creative_flow_manual_profile_verify_async_impl"
+          ]
+          if not impl_nodes:
+              raise SystemExit("Real async Flow profile verify implementation not found")
+          impl_node = sorted(impl_nodes, key=lambda n: n.lineno)[0]
+          impl_source = "".join(lines[impl_node.lineno-1:impl_node.end_lineno])
 
-          # Process bottom-up so line offsets remain valid.
-          for node in sorted(targets, key=lambda n: n.lineno, reverse=True):
-              start = node.lineno - 1
-              end = node.end_lineno
-              original_def = lines[start]
-              indent = original_def[:len(original_def)-len(original_def.lstrip())]
-              old_name = node.name
-              impl_name = old_name + "_impl"
-              lines[start] = original_def.replace(
-                  old_name + "(", impl_name + "(", 1
-              )
+          marker = "def _creative_account_pool_html("
+          marker_i = s.find(marker)
+          if marker_i < 0:
+              raise SystemExit("Creative account pool marker not found")
 
-              async_kw = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
-              wrapper = textwrap.dedent(f'''
-              {async_kw}def {old_name}(*args, **kwargs):
-                  _result = await {impl_name}(*args, **kwargs) if {bool(isinstance(node, ast.AsyncFunctionDef))} else {impl_name}(*args, **kwargs)
-                  try:
-                      import inspect as _inspect
-                      _sig = _inspect.signature({impl_name})
-                      _bound = _sig.bind_partial(*args, **kwargs)
-                      _account_id = (
-                          _bound.arguments.get("account_id")
-                          or _bound.arguments.get("account")
-                          or _bound.arguments.get("account_name")
-                      )
-                      _profile = (
-                          _bound.arguments.get("profile")
-                          or _bound.arguments.get("profile_path")
-                          or _bound.arguments.get("session_profile")
-                      )
-                      _worker = _bound.arguments.get("worker_id")
-                      _ok = bool(_result)
-                      if isinstance(_result, dict):
-                          _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
-                          _account_id = _account_id or _result.get("account_id")
-                          _profile = _profile or _result.get("profile_path")
-                          _worker = _worker or _result.get("worker_id")
-                      elif isinstance(_result, (tuple, list)):
-                          _ok = bool(_result[0]) if _result else False
-                      if _ok:
-                          _creative_activate_verified_flow_account(
-                              account_id=_account_id,
-                              profile_path=_profile,
-                              worker_id=_worker,
-                          )
-                  except Exception as _exc:
-                      try:
-                          workflow_cmd_log(
-                              "FLOW",
-                              "PROFILE_VERIFY_WRAPPER_ERROR",
-                              error=str(_exc)[:500],
-                          )
-                      except Exception:
-                          pass
-                  return _result
-              ''').lstrip()
-              wrapper_lines = [(indent + x if x.strip() else x) + "\n" for x in wrapper.splitlines()]
-              lines[end:end] = ["\n"] + wrapper_lines
+          # Preserve everything before the first real implementation, then
+          # replace ALL duplicated/corrupt wrappers up to account-pool HTML.
+          impl_start = s.find("async def _creative_flow_manual_profile_verify_async_impl")
+          if impl_start < 0 or impl_start >= marker_i:
+              raise SystemExit("Flow verify implementation boundary invalid")
 
-          s = "".join(lines)
-          # Patch the health-failure demotion in _creative_claim_account_checked_v1161.
-          # A recent successful browser Verify is stronger than a transient health probe.
-          if "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY" not in s:
-              marker = '        detail = str(detail or "")\\n        now = _creative_now()'
-              guard = textwrap.dedent(r'''
-              detail = str(detail or "")
-              now = _creative_now()
+          clean = textwrap.dedent(r'''
+          async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
+              _result = await _creative_flow_manual_profile_verify_async_impl(*args, **kwargs)
               try:
-                  with _batch_db() as db:
-                      _verified_row = db.execute(
-                          "SELECT last_success FROM creative_accounts WHERE account_id=? LIMIT 1",
-                          (account_id,),
-                      ).fetchone()
-                  _verified_at = str(_verified_row[0] or "") if _verified_row else ""
-                  if _verified_at:
-                      _dt = datetime.fromisoformat(_verified_at.replace("Z", "+00:00"))
-                      _age = (datetime.now(timezone.utc) - _dt).total_seconds()
-                      if 0 <= _age <= 900:
-                          workflow_cmd_log(
-                              "FLOW",
-                              "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY",
-                              account_id=account_id,
-                              age_seconds=round(_age, 1),
-                              detail=detail[:500],
-                              level="DEBUG",
-                          )
-                          return account_id, "OK"
-              except Exception:
-                  pass
-              ''').strip("\n")
-              if marker not in s:
-                  raise SystemExit("V11.6.3 health-failure marker not found")
-              s = s.replace(marker, guard, 1)
-          ast.parse(s, filename="hungcoi.py")
-          p.write_text(s, encoding="utf-8")
-          print("V11.6.2 verified-profile activation patch syntax OK")
+                  import inspect as _inspect
+                  _sig = _inspect.signature(_creative_flow_manual_profile_verify_async_impl)
+                  _bound = _sig.bind_partial(*args, **kwargs)
+                  _account_id = (
+                      _bound.arguments.get("account_id")
+                      or _bound.arguments.get("account")
+                      or _bound.arguments.get("account_name")
+                  )
+                  _profile = (
+                      _bound.arguments.get("profile")
+                      or _bound.arguments.get("profile_path")
+                      or _bound.arguments.get("session_profile")
+                  )
+                  _worker = _bound.arguments.get("worker_id")
+                  _ok = bool(_result)
+                  if isinstance(_result, dict):
+                      _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
+                      _account_id = _account_id or _result.get("account_id")
+                      _profile = _profile or _result.get("profile_path")
+                      _worker = _worker or _result.get("worker_id")
+                  elif isinstance(_result, (tuple, list)):
+                      _ok = bool(_result[0]) if _result else False
+                  if _ok:
+                      _creative_activate_verified_flow_account(
+                          account_id=_account_id,
+                          profile_path=_profile,
+                          worker_id=_worker,
+                      )
+              except Exception as _exc:
+                  try:
+                      workflow_cmd_log(
+                          "FLOW",
+                          "PROFILE_VERIFY_WRAPPER_ERROR",
+                          error=str(_exc)[:500],
+                      )
+                  except Exception:
+                      pass
+              return _result
 
-      - name: Commit patch
+          async def _creative_flow_manual_profile_verify_impl(account_id):
+              """Stable UI-facing implementation; delegates to the real async verifier."""
+              return await _creative_flow_manual_profile_verify_async(account_id)
+
+          async def _creative_flow_manual_profile_verify(*args, **kwargs):
+              _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs)
+              try:
+                  import inspect as _inspect
+                  _sig = _inspect.signature(_creative_flow_manual_profile_verify_impl)
+                  _bound = _sig.bind_partial(*args, **kwargs)
+                  _account_id = (
+                      _bound.arguments.get("account_id")
+                      or _bound.arguments.get("account")
+                      or _bound.arguments.get("account_name")
+                  )
+                  _profile = (
+                      _bound.arguments.get("profile")
+                      or _bound.arguments.get("profile_path")
+                      or _bound.arguments.get("session_profile")
+                  )
+                  _worker = _bound.arguments.get("worker_id")
+                  _ok = bool(_result)
+                  if isinstance(_result, dict):
+                      _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
+                      _account_id = _account_id or _result.get("account_id")
+                      _profile = _profile or _result.get("profile_path")
+                      _worker = _worker or _result.get("worker_id")
+                  elif isinstance(_result, (tuple, list)):
+                      _ok = bool(_result[0]) if _result else False
+                  if _ok:
+                      _creative_activate_verified_flow_account(
+                          account_id=_account_id,
+                          profile_path=_profile,
+                          worker_id=_worker,
+                      )
+              except Exception as _exc:
+                  try:
+                      workflow_cmd_log(
+                          "FLOW",
+                          "PROFILE_VERIFY_WRAPPER_ERROR",
+                          error=str(_exc)[:500],
+                      )
+                  except Exception:
+                      pass
+              return _result
+
+          ''').lstrip()
+
+          prefix = s[:impl_start]
+          suffix = s[marker_i:]
+          s = prefix + impl_source + "\n\n" + clean + suffix
+
+          ast.parse(s, filename="hungcoi.py")
+
+          # Hard safety checks: no recursive self-call remains in either wrapper.
+          for name in (
+              "_creative_flow_manual_profile_verify_async",
+              "_creative_flow_manual_profile_verify_impl",
+              "_creative_flow_manual_profile_verify",
+          ):
+              nodes = [
+                  n for n in ast.walk(ast.parse(s, filename="hungcoi.py"))
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name == name
+              ]
+              if len(nodes) != 1:
+                  raise SystemExit(f"{name}: expected exactly 1 definition, found {len(nodes)}")
+          if "_result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else _creative_flow_manual_profile_verify_impl(*args, **kwargs)" in s:
+              raise SystemExit("Recursive wrapper pattern still present")
+
+          p.write_text(s, encoding="utf-8")
+          print("V11.6.4: Creative Studio Flow profile verify recursion repaired")
+
+      - name: Commit repair
         shell: bash
         run: |
           git config user.name "github-actions[bot]"
@@ -217,6 +179,5 @@ jobs:
             echo "No changes"
             exit 0
           fi
-          git commit -m "V11.6.2: activate verified Flow profiles"
+          git commit -m "V11.6.4: repair Flow profile verify recursion"
           git push origin HEAD:fix/creative-studio-v7
-
