@@ -1922,7 +1922,7 @@ def _creative_master_full(project,scenes,requested_engine=CREATIVE_ENGINE_AUTO,s
     manifest=_creative_prepare_project(project,scenes,requested_engine)
     _creative_set_control(project,"RUNNING","MASTER FULL")
     if start:
-        count=int(os.getenv("VHUNG_CREATIVE_FLOW_WORKERS","2") or 2)
+        count=max(1, int(os.getenv("VHUNG_CREATIVE_FLOW_WORKERS","1") or 1))
         _creative_start_workers(project,count,"FLOW")
         try:
             dispatched=_creative_scheduler_dispatch(project)
@@ -14551,12 +14551,12 @@ def _creative_account_pool_summary():
 
 
 def _flow_reconcile_profile_registry():
-    """Remove only clearly stale Flow DB rows whose registered profile is gone.
-    Durable profile folders remain the source of truth for session persistence.
-    Never create a new account or delete a live CDP session here.
+    """Remove only DB rows whose durable profile folder is actually gone.
+
+    Canonical runtime never reads or caches Playwright objects from another
+    thread. Chrome/CDP may be closed while the verified profile remains valid.
     """
     _flow_account_schema()
-    global _CREATIVE_FLOW_ADAPTER
     stale = []
     with _batch_db() as db:
         rows = db.execute(
@@ -14566,19 +14566,8 @@ def _flow_reconcile_profile_registry():
         for row in rows:
             aid = str(row["account_id"] or "").strip()
             profile = str(row["session_profile"] or "").strip()
-            if not aid or not profile:
-                continue
-            try:
-                live = False
-                if _CREATIVE_FLOW_ADAPTER is not None:
-                    item = _CREATIVE_FLOW_ADAPTER._contexts.get(aid)
-                    if item:
-                        _pw, browser, page = item
-                        live = bool(browser.is_connected()) and not page.is_closed()
-                if not live and not Path(profile).expanduser().exists():
-                    stale.append(aid)
-            except Exception:
-                continue
+            if aid and profile and not Path(profile).expanduser().exists():
+                stale.append(aid)
         if stale:
             placeholders = ",".join("?" for _ in stale)
             db.execute(
@@ -14587,7 +14576,10 @@ def _flow_reconcile_profile_registry():
                 stale,
             )
     if stale:
-        workflow_cmd_log("FLOW_POOL", "STALE_PROFILES_RECONCILED", removed=len(stale), accounts=",".join(stale))
+        workflow_cmd_log(
+            "FLOW_POOL", "STALE_PROFILES_RECONCILED",
+            removed=len(stale), accounts=",".join(stale)
+        )
     return stale
 
 
@@ -15247,17 +15239,72 @@ _PLAYWRIGHT_INSTALL_LOCK = threading.RLock()
 _PLAYWRIGHT_INSTALL_RUNNING = False
 _PLAYWRIGHT_INSTALL_MESSAGE = "⚪ Chưa kiểm tra Playwright / Google Chrome."
 
-def _playwright_chrome_runtime_check():
-    """Check Playwright safely even when called from Gradio's asyncio event loop.
+def _playwright_runtime_candidates():
+    """Return Playwright Python package roots bundled with this tool/legacy tool.
 
-    IMPORTANT: Playwright Sync API must never be started in the Gradio asyncio
-    loop thread. The runtime probe therefore runs in a short-lived subprocess.
-    The actual Flow callbacks are already dispatched through _ASYNC_EXECUTOR.
+    A valid candidate is the directory named playwright containing
+    driver/package/cli.js. The parent of that directory is added to
+    PYTHONPATH/sys.path so Playwright uses its matching driver package.
     """
+    candidates = []
+    env = str(os.getenv("VHUNG_PLAYWRIGHT_RUNTIME") or "").strip()
+    if env:
+        candidates.append(Path(env).expanduser())
+    candidates.extend([
+        BASE / "playwright",
+        BASE / "tool" / "playwright",
+        BASE / "runtime" / "playwright",
+        BASE / "tool" / "runtime" / "playwright",
+    ])
+    for root in (BASE, *list(BASE.parents)[:4]):
+        candidates.extend([
+            root / "CloneVoice-1.1.18-win64" / "playwright",
+            root / "CloneVoice-1.1.18-win64" / "CloneVoice-1.1.18-win64" / "playwright",
+        ])
+    out = []
+    seen = set()
+    for raw in candidates:
+        try:
+            p = Path(raw).resolve()
+            if p.name.lower() == "package" and p.parent.name.lower() == "driver":
+                p = p.parent.parent
+            elif p.name.lower() == "driver":
+                p = p.parent
+            key = str(p).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if (p / "driver" / "package" / "cli.js").is_file() and (p / "__init__.py").is_file():
+                out.append(p)
+        except Exception:
+            continue
+    return out
+
+
+def _playwright_prepare_runtime():
+    """Prefer a portable Playwright runtime when present."""
+    roots = _playwright_runtime_candidates()
+    if roots:
+        root = roots[0]
+        parent = str(root.parent)
+        if parent not in sys.path:
+            sys.path.insert(0, parent)
+        os.environ["VHUNG_PLAYWRIGHT_ACTIVE_ROOT"] = str(root)
+        return str(root)
+    return ""
+
+
+def _playwright_chrome_runtime_check():
+    """Probe Playwright outside Gradio asyncio and support bundled old-tool driver."""
     try:
+        runtime_root = _playwright_prepare_runtime()
         import importlib.util
-        if importlib.util.find_spec("playwright") is None:
-            return False, "🔴 Thiếu Python package Playwright. Bấm CÀI / SỬA PLAYWRIGHT."
+        spec = importlib.util.find_spec("playwright")
+        if spec is None:
+            return False, (
+                "🔴 Không tìm thấy Playwright. Đặt thư mục playwright cũ vào "
+                "tool\\playwright hoặc đặt VHUNG_PLAYWRIGHT_RUNTIME tới thư mục playwright."
+            )
 
         probe_code = (
             "from playwright.sync_api import sync_playwright\n"
@@ -15265,12 +15312,18 @@ def _playwright_chrome_runtime_check():
             "pw.stop()\n"
             "print('PLAYWRIGHT_SYNC_OK')\n"
         )
+        env = os.environ.copy()
+        if runtime_root:
+            parent = str(Path(runtime_root).parent)
+            old_pp = env.get("PYTHONPATH", "")
+            env["PYTHONPATH"] = parent + (os.pathsep + old_pp if old_pp else "")
         try:
             proc = subprocess.run(
                 [sys.executable, "-c", probe_code],
                 capture_output=True,
                 text=True,
                 timeout=30,
+                env=env,
                 creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
             )
         except subprocess.TimeoutExpired:
@@ -15278,16 +15331,16 @@ def _playwright_chrome_runtime_check():
 
         if proc.returncode != 0 or "PLAYWRIGHT_SYNC_OK" not in (proc.stdout or ""):
             err = (proc.stderr or proc.stdout or "unknown error").strip()
-            return False, f"🔴 Playwright runtime lỗi: {err[:700]}"
+            return False, f"🔴 Playwright runtime lỗi: {err[:900]}"
 
         chrome = _flow_chrome_executable() if callable(globals().get("_flow_chrome_executable")) else None
         if chrome is None:
-            # Do not probe/play with Playwright's bundled Chromium/Chrome Testing.
-            return False, "🔴 Không tìm thấy Google Chrome Stable. Tool KHÔNG tự cài Chrome Testing."
+            return False, "🔴 Không tìm thấy Google Chrome Stable."
 
-        return True, f"🟢 Playwright OK · Google Chrome Stable OK · {chrome}"
+        source = f"PORTABLE {runtime_root}" if runtime_root else "PYTHON PACKAGE"
+        return True, f"🟢 Playwright OK · {source} · Chrome Stable OK · {chrome}"
     except Exception as exc:
-        return False, f"🔴 Playwright runtime lỗi: {str(exc)[:700]}"
+        return False, f"🔴 Playwright runtime lỗi: {str(exc)[:900]}"
 
 def _playwright_install_worker():
     global _PLAYWRIGHT_INSTALL_RUNNING, _PLAYWRIGHT_INSTALL_MESSAGE
@@ -19676,6 +19729,7 @@ def _flow_thread_context(self, account_id):
         pass
     else:
         raise RuntimeError("Flow Sync Playwright phải chạy trong worker thread, không chạy trong asyncio callback.")
+    _playwright_prepare_runtime()
     from playwright.sync_api import sync_playwright
     pw = sync_playwright().start()
     try:
@@ -19798,28 +19852,128 @@ def _flow_find_prompt_box(page, timeout=30):
         f"url={str(page.url or '')[:300]} · body={body!r}"
     )
 
-def _flow_click_generate_image(page):
-    for pat in (r"^Generate Image$",r"Generate Image",r"^Generate$",r"Create Image"):
+def _flow_generation_started(page, before_img_count=0):
+    """Best-effort evidence that Flow accepted the submit."""
+    try:
+        if page.locator("img").count() > int(before_img_count or 0):
+            return True
+    except Exception:
+        pass
+    markers = (
+        r"generating", r"creating", r"processing", r"rendering",
+        r"đang tạo", r"đang xử lý", r"cancel", r"stop"
+    )
+    for pat in markers:
         try:
-            btn=page.get_by_role("button",name=re.compile(pat,re.I)).last
-            if btn.count() and btn.is_visible() and btn.is_enabled():
-                btn.scroll_into_view_if_needed()
-                btn.click(timeout=5000)
+            loc = page.get_by_text(re.compile(pat, re.I))
+            if loc.count() and any(
+                loc.nth(i).is_visible()
+                for i in range(max(0, loc.count() - 5), loc.count())
+            ):
                 return True
         except Exception:
             pass
     try:
-        buttons=page.locator("button")
-        for i in range(buttons.count()-1,-1,-1):
-            b=buttons.nth(i)
-            if not b.is_visible() or not b.is_enabled():
-                continue
-            label=" ".join(filter(None,[b.inner_text(timeout=300),b.get_attribute("aria-label"),b.get_attribute("title")]))
-            if re.search(r"generate\s*image|create\s*image",label,re.I):
-                b.click(timeout=5000)
+        for sel in (
+            "[aria-busy='true']",
+            "[role='progressbar']",
+            "[data-testid*='progress' i]",
+            "[data-testid*='generation' i]",
+        ):
+            loc = page.locator(sel)
+            if loc.count() and any(
+                loc.nth(i).is_visible()
+                for i in range(max(0, loc.count() - 5), loc.count())
+            ):
                 return True
     except Exception:
         pass
+    return False
+
+
+def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
+    """Submit exactly once, like the old Creative Studio.
+
+    Prefer a real Generate/Create control. Keyboard submission is only a
+    last-resort fallback and must show evidence that generation started.
+    """
+    patterns = (
+        r"^Generate Image$", r"^Generate images?$", r"^Generate$",
+        r"^Create Image$", r"^Create images?$", r"^Create$",
+        r"^Run$", r"^Tạo ảnh$", r"^Tạo hình$", r"^Tạo$",
+    )
+    for pat in patterns:
+        try:
+            loc = page.get_by_role("button", name=re.compile(pat, re.I))
+            for i in range(loc.count() - 1, -1, -1):
+                btn = loc.nth(i)
+                if btn.is_visible() and btn.is_enabled():
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=5000)
+                    return True
+        except Exception:
+            pass
+
+    try:
+        buttons = page.locator("button,[role='button']")
+        for i in range(buttons.count() - 1, -1, -1):
+            btn = buttons.nth(i)
+            try:
+                if not btn.is_visible() or not btn.is_enabled():
+                    continue
+                parts = []
+                for attr in (
+                    "aria-label", "title", "data-testid", "data-test-id",
+                    "data-tooltip", "name"
+                ):
+                    v = btn.get_attribute(attr)
+                    if v:
+                        parts.append(str(v))
+                try:
+                    parts.append(btn.inner_text(timeout=250) or "")
+                except Exception:
+                    pass
+                label = " ".join(parts)
+                if re.search(
+                    r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?",
+                    label,
+                    re.I,
+                ):
+                    if re.search(
+                        r"project|new\s+project|menu|settings|upload|attach|delete",
+                        label,
+                        re.I,
+                    ):
+                        continue
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=5000)
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+
+    box = prompt_box
+    if box is None:
+        try:
+            box = _flow_find_prompt_box(page, 5)
+        except Exception:
+            box = None
+    if box is not None:
+        try:
+            box.click(timeout=3000)
+        except Exception:
+            pass
+        for key in ("Control+Enter", "Enter"):
+            try:
+                box.press(key)
+            except Exception:
+                continue
+            deadline = time.monotonic() + 4.0
+            while time.monotonic() < deadline:
+                if _flow_generation_started(page, before_img_count):
+                    return True
+                time.sleep(0.25)
     return False
 
 def _flow_download_latest_asset(page,before_img_count,timeout=900):
@@ -19917,15 +20071,11 @@ def _flow_run_real_v115(self,job,worker_id,account_id=None):
             except Exception:
                 box.fill(prompt)
             workflow_cmd_log("FLOW","PROMPT_IMPORTED",account_id=account_id,scene=job.get("scene_id"))
-            try:
-                box.press("Control+Enter")
-            except Exception:
-                pass
             if _flow_page_has_captcha(page):
                 raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
             try: before_img_count=page.locator("img").count()
             except Exception: before_img_count=0
-            if not _flow_click_generate_image(page):
+            if not _flow_click_generate_image(page, box, before_img_count):
                 raise CreativeFlowUnavailable(
                     "Không tìm thấy nút Generate/Create của Google Flow sau khi đã tạo Project và nhập Prompt."
                 )
