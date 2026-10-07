@@ -1,6 +1,4 @@
-
-# trigger
-name: V11.5.2 Flow worker patch
+name: V11.5.3 Flow worker patch
 
 on:
   push:
@@ -28,87 +26,59 @@ jobs:
 
           p = Path("hungcoi.py")
           s = p.read_text(encoding="utf-8")
-
           start = s.index("def _flow_click_generate_image(page):")
           end = s.index("\ndef _flow_download_latest_asset(", start)
 
           new = r'''def _flow_click_generate_image(page):
-    """Click the real Flow Generate/Create control.
-
-    Flow's UI changes between builds and the generate control is often an
-    icon-only button without an accessible name.  The old Creative Studio
-    behavior was: focus the prompt, submit through the visible composer
-    control, then wait for the generated asset.  This resolver keeps that
-    behavior instead of depending on one exact aria-label.
-    """
-    patterns = (
-        r"^Generate Image$",
-        r"^Generate images?$",
-        r"^Generate$",
-        r"^Create Image$",
-        r"^Create images?$",
-        r"^Create$",
-        r"^Run$",
-        r"^Tạo ảnh$",
-        r"^Tạo$",
-        r"^Tạo hình$",
+    """Submit the real Flow composer without depending on one aria-label."""
+    generate_re = re.compile(
+        r"generate|create\s*(image|images|video|videos)?|submit|run|tạo\s*(ảnh|hình)?",
+        re.I,
+    )
+    bad_re = re.compile(
+        r"cancel|close|attach|upload|add|settings|menu|more|delete|download|share|help",
+        re.I,
     )
 
-    # 1) Accessible buttons / role=button.
-    for pat in patterns:
-        for locator in (
-            page.get_by_role("button", name=re.compile(pat, re.I)),
-            page.locator("[role='button']").filter(has_text=re.compile(pat, re.I)),
+    def _label(node):
+        vals = []
+        for name in (
+            "aria-label", "title", "data-testid", "data-test-id",
+            "data-tooltip", "data-tooltip-content", "name",
         ):
             try:
-                count = locator.count()
-                for i in range(count - 1, -1, -1):
-                    b = locator.nth(i)
-                    if b.is_visible() and b.is_enabled():
-                        b.scroll_into_view_if_needed()
-                        b.click(timeout=5000)
-                        return True
+                v = node.get_attribute(name)
+                if v:
+                    vals.append(str(v))
             except Exception:
                 pass
+        try:
+            vals.append(node.inner_text(timeout=250) or "")
+        except Exception:
+            pass
+        return " ".join(vals).strip()
 
-    # 2) Icon buttons: inspect every visible enabled button's text and
-    #    accessibility/tooltip attributes. This catches Flow builds where
-    #    the button has no visible text.
-    try:
-        buttons = page.locator("button")
-        for i in range(buttons.count() - 1, -1, -1):
-            b = buttons.nth(i)
-            try:
+    # 1) Resolve the visible Generate/Create control by accessible metadata.
+    for selector in (
+        "button", "[role='button']", "[aria-label]", "[title]",
+        "[data-testid]", "[data-tooltip]",
+    ):
+        try:
+            loc = page.locator(selector)
+            for i in range(loc.count() - 1, -1, -1):
+                b = loc.nth(i)
                 if not b.is_visible() or not b.is_enabled():
                     continue
-                attrs = []
-                for name in (
-                    "aria-label", "title", "data-testid", "data-test-id",
-                    "data-tooltip", "data-tooltip-content", "name"
-                ):
-                    v = b.get_attribute(name)
-                    if v:
-                        attrs.append(str(v))
-                try:
-                    attrs.append(b.inner_text(timeout=300) or "")
-                except Exception:
-                    pass
-                label = " ".join(attrs)
-                if re.search(
-                    r"generate|create|run|submit|tạo\s*(ảnh|hình)?",
-                    label, re.I
-                ):
+                label = _label(b)
+                if generate_re.search(label) and not bad_re.search(label):
                     b.scroll_into_view_if_needed()
                     b.click(timeout=5000)
                     return True
-            except Exception:
-                continue
-    except Exception:
-        pass
+        except Exception:
+            continue
 
-    # 3) Composer-relative fallback. The actual Flow generate button can be
-    #    an unlabeled icon button inside the same composer as the prompt.
-    #    Find the focused/visible prompt box, then inspect nearby buttons.
+    # 2) Old Creative Studio fallback: submit from the focused Flow composer.
+    #    One Ctrl+Enter attempt, then one Enter attempt; never spam keys.
     try:
         boxes = page.locator(
             "textarea, [contenteditable='true'], [role='textbox'], input[type='text']"
@@ -120,46 +90,17 @@ jobs:
                 box = x
                 break
         if box is not None:
-            # Keep the same visible browser interaction as the old tool:
-            # Enter first, then click an icon control if Flow requires it.
+            box.click(timeout=3000)
             try:
                 box.press("Control+Enter")
+                time.sleep(1.0)
+                return True
             except Exception:
                 pass
             try:
                 box.press("Enter")
-            except Exception:
-                pass
-
-            try:
-                parent = box.locator(
-                    "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
-                )
-                controls = parent.locator("button,[role='button']")
-                for i in range(controls.count() - 1, -1, -1):
-                    c = controls.nth(i)
-                    if not c.is_visible() or not c.is_enabled():
-                        continue
-                    label = " ".join(
-                        filter(
-                            None,
-                            [
-                                c.get_attribute("aria-label"),
-                                c.get_attribute("title"),
-                                c.get_attribute("data-testid"),
-                                c.get_attribute("data-tooltip"),
-                                c.inner_text(timeout=200),
-                            ],
-                        )
-                    )
-                    if not re.search(
-                        r"close|cancel|attach|upload|add|settings|menu|more|delete",
-                        label or "",
-                        re.I,
-                    ):
-                        c.scroll_into_view_if_needed()
-                        c.click(timeout=5000)
-                        return True
+                time.sleep(1.0)
+                return True
             except Exception:
                 pass
     except Exception:
@@ -181,5 +122,5 @@ jobs:
             echo "No changes"
             exit 0
           fi
-          git commit -m "V11.5.2: restore real Flow Generate control"
+          git commit -m "V11.5.3: use real Flow composer submission fallback"
           git push origin HEAD:fix/creative-studio-v7
