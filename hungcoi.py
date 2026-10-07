@@ -121,7 +121,7 @@ def _zimage_session_bootstrap(project, status_cb=None):
 # ============================================================
 
 BASE = Path(__file__).resolve().parent
-APP_DISPLAY_NAME = "VHƯNG PRO MAX"
+APP_DISPLAY_NAME = "HƯNG PRO WORKFLOW"
 DATA = BASE / "data"
 # Project Archive storage: keep archive metadata outside individual project folders.
 PROJECT_ARCHIVE_DIR = BASE / "tool" / "ProjectArchive"
@@ -13478,6 +13478,786 @@ def _creative_resolve_captcha_ui(project):
     return _creative_hud(project),f"✅ Account {row['account_id']} ACTIVE · Job {row['job_id']} READY · Scheduler tiếp tục."
 
 
+
+# ============================================================
+# CREATIVE STUDIO V7 — CANONICAL RUNTIME OVERRIDES
+# ============================================================
+# This block is intentionally last so the runtime has ONE authoritative
+# implementation without deleting the older migration history.
+# Policy:
+#   Google Flow = PRIMARY
+#   Z Image = FALLBACK / LOCAL
+#   FLUX = removed from production routing
+#   Image-only scene = IMAGE -> POSTPROCESS -> CLEAN_MAX_VIP -> QC
+#   Video scene = requires real video/depth/motion backends; never fake DONE.
+# ============================================================
+
+APP_DISPLAY_NAME = "HƯNG PRO WORKFLOW"
+CREATIVE_JOB_STAGES = ("IMAGE", "DEPTH", "MOTION", "POSTPROCESS", "CLEAN_MAX_VIP", "QC", "TIMELINE")
+CREATIVE_IMAGE_ONLY_STAGES = ("IMAGE", "POSTPROCESS", "CLEAN_MAX_VIP", "QC")
+CREATIVE_IMAGE_WIDTH = 1024
+CREATIVE_IMAGE_HEIGHT = 576
+CREATIVE_FLOW_RESULT_TIMEOUT = int(os.getenv("VHUNG_FLOW_RESULT_TIMEOUT", "900") or 900)
+CREATIVE_FLOW_POLL_SECONDS = 1.0
+
+def _creative_scene_metadata(scene):
+    scene = scene if isinstance(scene, dict) else {}
+    refs = scene.get("reference_images") or scene.get("references") or []
+    ref_ids = scene.get("reference_image_ids") or scene.get("ref_image_ids") or []
+    if not isinstance(refs, list): refs = [refs]
+    if not isinstance(ref_ids, list): ref_ids = [ref_ids]
+    return {
+        "prompt": str(scene.get("prompt") or scene.get("image_prompt") or scene.get("visual_prompt") or "").strip(),
+        "image_prompt": str(scene.get("image_prompt") or scene.get("prompt") or "").strip(),
+        "media_type": scene_media_type(scene, "image"),
+        "expected_width": CREATIVE_IMAGE_WIDTH,
+        "expected_height": CREATIVE_IMAGE_HEIGHT,
+        "reference_images": [str(x) for x in refs if str(x).strip()][:3],
+        "reference_image_ids": [str(x) for x in ref_ids if str(x).strip()][:3],
+    }
+
+def _creative_stage_dependencies(stage, media_type="image"):
+    mt = str(media_type or "image").lower()
+    if stage == "IMAGE":
+        return []
+    if stage == "DEPTH":
+        return ["IMAGE"]
+    if stage == "MOTION":
+        return ["DEPTH"]
+    if stage == "POSTPROCESS":
+        return ["MOTION"] if mt == "video" else ["IMAGE"]
+    if stage == "CLEAN_MAX_VIP":
+        return ["POSTPROCESS"]
+    if stage == "QC":
+        return ["CLEAN_MAX_VIP"]
+    if stage == "TIMELINE":
+        return ["QC"]
+    return []
+
+def _creative_create_jobs(project, scenes, requested_engine=CREATIVE_ENGINE_AUTO):
+    """Idempotently materialize one job per scene/stage with real scene metadata."""
+    _creative_v3_migrate()
+    project = _batch_project_name(project)
+    now = _creative_now()
+    with _batch_db() as db:
+        for scene in scenes or []:
+            sid = str(scene.get("scene_id") or scene.get("id") or "").strip()
+            if not sid:
+                continue
+            mt = scene_media_type(scene, "image")
+            if mt == "image":
+                stages = CREATIVE_JOB_STAGES
+                skipped = {"DEPTH", "MOTION", "TIMELINE"}
+            else:
+                stages = CREATIVE_JOB_STAGES
+                skipped = {"IMAGE"}
+            meta = _creative_scene_metadata(scene)
+            for stage in stages:
+                status = "SKIPPED" if stage in skipped else "PENDING"
+                jid = _creative_job_id(project, sid, stage)
+                deps = _creative_stage_dependencies(stage, mt)
+                # Never reset an already completed job. New/unfinished rows receive
+                # fresh metadata/dependencies so the scheduler has the real prompt.
+                db.execute(
+                    """INSERT INTO creative_jobs(
+                        job_id,project_id,scene_id,stage,status,priority,max_retry,
+                        ready_at,requested_engine,dependency_json,metadata_json,
+                        created_at,updated_at
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(project_id,scene_id,stage) DO UPDATE SET
+                        dependency_json=excluded.dependency_json,
+                        requested_engine=excluded.requested_engine,
+                        metadata_json=CASE
+                            WHEN creative_jobs.status IN ('DONE','SKIPPED') THEN creative_jobs.metadata_json
+                            ELSE excluded.metadata_json END,
+                        updated_at=excluded.updated_at""",
+                    (
+                        jid, project, sid, stage, status,
+                        _creative_priority("NORMAL"), CREATIVE_MAX_RETRY, now,
+                        requested_engine, _creative_json(deps), _creative_json(meta, "{}"),
+                        now, now,
+                    ),
+                )
+
+def _creative_find_scene_contract(project, scene_id, stage):
+    with _batch_db() as db:
+        row = db.execute(
+            "SELECT * FROM creative_jobs WHERE project_id=? AND scene_id=? AND stage=?",
+            (_batch_project_name(project), str(scene_id), stage),
+        ).fetchone()
+    return _creative_job_output_from_db(row) if row else None
+
+# ---------- Flow session lifecycle ----------
+
+def _flow_context_resilient(self, account_id):
+    """One persistent Playwright context per Flow account; recreate only if dead."""
+    try:
+        item = self._contexts.get(account_id)
+        if item:
+            pw, browser, page = item
+            alive = True
+            try:
+                alive = bool(browser.is_connected()) and not page.is_closed()
+            except Exception:
+                alive = False
+            if alive:
+                return item
+            try: browser.close()
+            except Exception: pass
+            try: pw.stop()
+            except Exception: pass
+            self._contexts.pop(account_id, None)
+    except Exception:
+        self._contexts.pop(account_id, None)
+    # Delegate initial creation to the original implementation.
+    return _V7_FLOW_CONTEXT_ORIGINAL(self, account_id)
+
+_V7_FLOW_CONTEXT_ORIGINAL = GoogleFlowAdapter._context
+GoogleFlowAdapter._context = _flow_context_resilient
+
+def _flow_health_check(self, account_id):
+    try:
+        pw, browser, page = self._context(account_id)
+        if not browser.is_connected() or page.is_closed():
+            return {"ok": False, "detail": "Flow browser/session đã đóng."}
+        if self._captcha_visible(page):
+            return {"ok": False, "detail": "CAPTCHA_REQUIRED"}
+        # A persistent session may start on an auth/error page. Do not claim healthy
+        # merely because Chromium exists.
+        url = str(page.url or "")
+        if "labs.google" not in url and "google" not in url:
+            try:
+                page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+            except Exception as exc:
+                return {"ok": False, "detail": f"Không mở được Flow: {exc}"}
+        if self._captcha_visible(page):
+            return {"ok": False, "detail": "CAPTCHA_REQUIRED"}
+        body = ""
+        try: body = (page.locator("body").inner_text(timeout=3000) or "").lower()
+        except Exception: pass
+        auth_markers = ("sign in", "log in", "đăng nhập")
+        if any(x in body for x in auth_markers):
+            return {"ok": False, "detail": "Flow session chưa đăng nhập."}
+        return {"ok": True, "detail": "Flow session HEALTHY"}
+    except Exception as exc:
+        return {"ok": False, "detail": str(exc)}
+
+GoogleFlowAdapter.health_check = _flow_health_check
+
+def _flow_click_download_control(page):
+    """Try only user-visible download controls; never bypass challenges."""
+    selectors = [
+        "a[download]",
+        "a[href*='download']",
+        "button[aria-label*='Download']",
+        "button[title*='Download']",
+        "button",
+    ]
+    for selector in selectors:
+        try:
+            loc = page.locator(selector)
+            count = loc.count()
+            start = max(0, count - 5)
+            for i in range(count - 1, start - 1, -1):
+                item = loc.nth(i)
+                label = ""
+                try:
+                    label = ((item.inner_text(timeout=500) or "") + " " +
+                             (item.get_attribute("aria-label") or "") + " " +
+                             (item.get_attribute("title") or "")).lower()
+                except Exception:
+                    pass
+                if selector == "button" and "download" not in label and "tải" not in label:
+                    continue
+                if not item.is_visible():
+                    continue
+                try:
+                    with page.expect_download(timeout=2500) as info:
+                        item.click(timeout=1500)
+                    return info.value
+                except Exception:
+                    continue
+        except Exception:
+            continue
+    return None
+
+def _flow_wait_for_result_download(self, page, worker_id, job_id):
+    """Wait for the real Flow result without a hard-coded 180s sleep."""
+    deadline = time.monotonic() + max(30, CREATIVE_FLOW_RESULT_TIMEOUT)
+    last_hb = 0.0
+    while time.monotonic() < deadline:
+        if self._captcha_visible(page):
+            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+        try:
+            if page.is_closed():
+                raise CreativeFlowUnavailable("Flow page đã đóng.")
+        except CreativeFlowUnavailable:
+            raise
+        except Exception as exc:
+            raise CreativeFlowUnavailable(f"Không kiểm tra được Flow page: {exc}")
+        now = time.monotonic()
+        if now - last_hb >= 5:
+            _creative_heartbeat(worker_id, job_id)
+            last_hb = now
+
+        # Some Flow builds emit the download immediately; others expose a Download
+        # control only after rendering. Check both paths.
+        try:
+            dl = _flow_click_download_control(page)
+            if dl is not None:
+                return dl
+        except Exception:
+            pass
+
+        # If a generated image is already visible, keep waiting for the user-visible
+        # Download control instead of guessing a private blob URL.
+        time.sleep(CREATIVE_FLOW_POLL_SECONDS)
+    raise CreativeFlowTimeout(
+        f"Google Flow chưa trả output sau {CREATIVE_FLOW_RESULT_TIMEOUT}s."
+    )
+
+def _flow_run_v7(self, job, worker_id, account_id=None):
+    if not account_id:
+        raise CreativeAuthError("Flow Job chưa có Account.")
+    _creative_heartbeat(worker_id, job["job_id"])
+    try:
+        _pw, _browser, page = self._context(account_id)
+    except Exception as exc:
+        raise CreativeFlowUnavailable(f"Không mở được Session Flow: {exc}")
+    if self._captcha_visible(page):
+        raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+    meta = _creative_load_json(job.get("metadata_json") or "{}", {})
+    prompt = str(meta.get("prompt") or meta.get("image_prompt") or "").strip()
+    if not prompt:
+        raise CreativeInvalidRequest(
+            f"Job Flow {job.get('job_id')} không có prompt scene."
+        )
+
+    box = page.get_by_role("textbox").last
+    if not box.count():
+        box = page.locator("textarea, [contenteditable='true']").last
+    if not box.count():
+        raise CreativeFlowUnavailable("Không tìm thấy ô Prompt Google Flow.")
+    box.fill(prompt)
+    if self._captcha_visible(page):
+        raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+
+    submitted = False
+    buttons = page.get_by_role("button")
+    for label in ("Generate", "Create", "Run", "Tạo", "Generate image"):
+        try:
+            btn = buttons.filter(has_text=label).last
+            if btn.count() and btn.is_enabled():
+                btn.click()
+                submitted = True
+                break
+        except Exception:
+            continue
+    if not submitted:
+        raise CreativeFlowUnavailable("Không tìm thấy nút tạo ảnh Google Flow.")
+
+    _creative_heartbeat(worker_id, job["job_id"])
+    download = self._wait_for_result_download(page, worker_id, job["job_id"])
+    out_dir = _project_image_dir(project_dir(job["project_id"]))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / f"{job['scene_id']}.png"
+    download.save_as(str(out))
+    return _creative_output_contract(job, out, CREATIVE_ENGINE_FLOW, account_id, worker_id)
+
+GoogleFlowAdapter._wait_for_result_download = _flow_wait_for_result_download
+GoogleFlowAdapter.run = _flow_run_v7
+
+# ---------- Account claim: no-account is WAITING, not AUTH_ERROR ----------
+
+def _creative_claim_account_checked_v7(worker_id, job_id, provider=CREATIVE_ENGINE_FLOW):
+    _creative_refresh_cooldowns()
+    account_id = _creative_atomic_claim_account(worker_id, job_id, provider)
+    if not account_id:
+        return None, "NO_ACTIVE_ACCOUNT"
+    ok, detail = _creative_session_health(account_id, worker_id, force=True)
+    if not ok:
+        detail = str(detail or "")
+        now = _creative_now()
+        with _batch_db() as db:
+            if "CAPTCHA" in detail.upper() or "UNUSUAL" in detail.upper():
+                db.execute(
+                    "UPDATE creative_accounts SET status='CAPTCHA',last_error=?,updated_at=? WHERE account_id=?",
+                    (detail[:1500], now, account_id),
+                )
+                db.execute(
+                    "UPDATE creative_jobs SET status='CAPTCHA',error_class='CAPTCHA',"
+                    "error=?,worker_id=NULL,account_id=?,updated_at=? "
+                    "WHERE job_id=? AND status='RUNNING'",
+                    (detail[:1500], account_id, now, job_id),
+                )
+            else:
+                db.execute(
+                    "UPDATE creative_accounts SET status='AUTH_ERROR',last_error=?,updated_at=? WHERE account_id=?",
+                    (detail[:1500], now, account_id),
+                )
+                db.execute(
+                    "UPDATE creative_jobs SET status='RETRY',error_class='AUTH_ERROR',"
+                    "error=?,worker_id=NULL,account_id=NULL,ready_at=?,updated_at=? "
+                    "WHERE job_id=? AND status='RUNNING'",
+                    (detail[:1500], now, now, job_id),
+                )
+            db.execute(
+                "UPDATE creative_workers SET status='IDLE',job_id=NULL,account_id=NULL,updated_at=? WHERE worker_id=?",
+                (now, worker_id),
+            )
+        return None, detail
+    return account_id, "OK"
+
+_creative_claim_account_checked = _creative_claim_account_checked_v7
+
+# ---------- Real image postprocess / Clean MAX VIP / QC ----------
+
+def _creative_image_input_path(job):
+    contract = _creative_job_output_from_db(job)
+    if contract:
+        p = Path(str((contract.get("output") or {}).get("path") or ""))
+        if p.is_file():
+            return p
+    return _creative_find_existing_scene_output(job["project_id"], job["scene_id"])
+
+def _creative_postprocess_image(job, worker_id):
+    src = _creative_image_input_path(job)
+    if not src or not src.is_file():
+        raise CreativeFlowUnavailable(f"POSTPROCESS thiếu IMAGE output: {job['scene_id']}")
+    try:
+        from PIL import Image
+        out_dir = _project_image_dir(project_dir(job["project_id"])) / "Postprocess"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{job['scene_id']}_post.png"
+        with Image.open(src) as im:
+            im.load()
+            # Normalize to a standard PNG while preserving the requested frame size.
+            if im.size != (CREATIVE_IMAGE_WIDTH, CREATIVE_IMAGE_HEIGHT):
+                im = im.resize((CREATIVE_IMAGE_WIDTH, CREATIVE_IMAGE_HEIGHT), Image.Resampling.LANCZOS)
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            im.save(out, format="PNG", optimize=True)
+        return _creative_output_contract(job, out, "POSTPROCESS", None, worker_id)
+    except Exception as exc:
+        raise CreativeFlowUnavailable(f"POSTPROCESS ảnh lỗi: {exc}")
+
+def _creative_clean_max_vip(job, worker_id):
+    src = _creative_image_input_path(job)
+    if not src or not src.is_file():
+        # For CLEAN, prefer the preceding POSTPROCESS contract explicitly.
+        with _batch_db() as db:
+            row = db.execute(
+                "SELECT * FROM creative_jobs WHERE project_id=? AND scene_id=? AND stage='POSTPROCESS'",
+                (job["project_id"], job["scene_id"]),
+            ).fetchone()
+        if row:
+            c = _creative_job_output_from_db(row)
+            src = Path(str((c or {}).get("output", {}).get("path") or ""))
+    if not src or not src.is_file():
+        raise CreativeFlowUnavailable(f"CLEAN MAX VIP thiếu POSTPROCESS output: {job['scene_id']}")
+    try:
+        from PIL import Image
+        out_dir = _project_image_dir(project_dir(job["project_id"])) / "Cleaned"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out = out_dir / f"{job['scene_id']}.png"
+        with Image.open(src) as im:
+            im.load()
+            if im.size != (CREATIVE_IMAGE_WIDTH, CREATIVE_IMAGE_HEIGHT):
+                im = im.resize((CREATIVE_IMAGE_WIDTH, CREATIVE_IMAGE_HEIGHT), Image.Resampling.LANCZOS)
+            if im.mode not in ("RGB", "RGBA"):
+                im = im.convert("RGBA" if "A" in im.getbands() else "RGB")
+            # Re-save without carrying EXIF/text/ICC chunks from the source.
+            clean = Image.new(im.mode, im.size)
+            clean.paste(im)
+            clean.save(out, format="PNG", optimize=True)
+        audit = out_dir / f"{job['scene_id']}.clean.json"
+        write_json(audit, {
+            "scene_id": job["scene_id"],
+            "source": str(src),
+            "output": str(out),
+            "metadata_stripped": True,
+            "width": CREATIVE_IMAGE_WIDTH,
+            "height": CREATIVE_IMAGE_HEIGHT,
+            "timestamp": _creative_now(),
+        })
+        return _creative_output_contract(job, out, "CLEAN_MAX_VIP", None, worker_id)
+    except Exception as exc:
+        raise CreativeFlowUnavailable(f"CLEAN MAX VIP lỗi: {exc}")
+
+class _V7PostProcessAdapter(CreativeStageAdapter):
+    stage = "POSTPROCESS"
+    def run_job(self, job, worker_id):
+        return _creative_postprocess_image(job, worker_id)
+
+class _V7CleanAdapter(CreativeStageAdapter):
+    stage = "CLEAN_MAX_VIP"
+    def run_job(self, job, worker_id):
+        return _creative_clean_max_vip(job, worker_id)
+
+class _V7QCAdapter(CreativeStageAdapter):
+    stage = "QC"
+    def run_job(self, job, worker_id):
+        with _batch_db() as db:
+            row = db.execute(
+                "SELECT * FROM creative_jobs WHERE project_id=? AND scene_id=? AND stage='CLEAN_MAX_VIP'",
+                (job["project_id"], job["scene_id"]),
+            ).fetchone()
+        if not row:
+            raise CreativeFlowUnavailable("QC thiếu CLEAN_MAX_VIP job.")
+        contract = _creative_job_output_from_db(row)
+        if not contract:
+            raise CreativeFlowUnavailable("QC thiếu Clean Output Contract.")
+        ok, reason = _creative_verify_output_contract(
+            contract, job["project_id"], job["scene_id"]
+        )
+        if not ok:
+            raise CreativeFlowUnavailable(f"QC FAIL: {reason}")
+        out = Path(str((contract.get("output") or {}).get("path") or ""))
+        if not out.is_file():
+            raise CreativeFlowUnavailable("QC output không tồn tại.")
+        try:
+            from PIL import Image
+            with Image.open(out) as im:
+                im.load()
+                if im.size != (CREATIVE_IMAGE_WIDTH, CREATIVE_IMAGE_HEIGHT):
+                    raise CreativeFlowUnavailable(
+                        f"QC sai kích thước {im.size}; yêu cầu 1024x576."
+                    )
+        except CreativeFlowUnavailable:
+            raise
+        except Exception as exc:
+            raise CreativeFlowUnavailable(f"QC ảnh lỗi: {exc}")
+        return _creative_output_contract(job, out, "QC", None, worker_id)
+
+_CREATIVE_STAGE_ADAPTERS["POSTPROCESS"] = _V7PostProcessAdapter()
+_CREATIVE_STAGE_ADAPTERS["CLEAN_MAX_VIP"] = _V7CleanAdapter()
+_CREATIVE_STAGE_ADAPTERS["QC"] = _V7QCAdapter()
+
+# ---------- Canonical dispatcher ----------
+
+def _creative_wait_for_account(job_id, worker_id, reason="NO_ACTIVE_ACCOUNT"):
+    now = _creative_now()
+    ready = (datetime.now(timezone.utc) + timedelta(seconds=5)).isoformat()
+    with _batch_db() as db:
+        db.execute(
+            "UPDATE creative_jobs SET status='RETRY',error_class='SERVER_BUSY',error=?,"
+            "ready_at=?,worker_id=NULL,account_id=NULL,updated_at=? "
+            "WHERE job_id=? AND status='RUNNING'",
+            (reason, ready, now, job_id),
+        )
+        db.execute(
+            "UPDATE creative_workers SET status='IDLE',job_id=NULL,account_id=NULL,updated_at=? WHERE worker_id=?",
+            (now, worker_id),
+        )
+
+def _creative_dispatch_worker_v7(worker_id, job):
+    def runner():
+        account_id = None
+        try:
+            _creative_heartbeat(worker_id, job["job_id"])
+            if _creative_worker_stop_requested(worker_id):
+                _creative_retry_v3(job["job_id"], "SERVER_BUSY", "STOP trước khi worker bắt đầu.", None, allow_fallback=False)
+                _creative_release_worker(worker_id, "IDLE", "STOP")
+                return
+            stage = str(job.get("stage") or "IMAGE").upper()
+
+            if stage == "IMAGE":
+                requested = str(job.get("requested_engine") or CREATIVE_ENGINE_AUTO).upper()
+                force_z = requested == CREATIVE_ENGINE_AUTO and bool(job.get("fallback_reason")) and "Z Image" in str(job.get("fallback_reason"))
+                if force_z:
+                    engine, reason = CREATIVE_ENGINE_ZIMAGE, "Fallback Z Image đã được ghi trong Job."
+                else:
+                    engine, reason = _creative_choose_engine_for_worker(requested)
+                if not engine:
+                    _creative_wait_for_account(job["job_id"], worker_id, reason or "NO_ENGINE")
+                    return
+                _creative_set_actual_engine(job["job_id"], engine, reason)
+                if engine == CREATIVE_ENGINE_FLOW:
+                    account_id, detail = _creative_claim_account_checked(worker_id, job["job_id"], "GOOGLE_FLOW")
+                    if not account_id:
+                        if detail == "NO_ACTIVE_ACCOUNT":
+                            _creative_wait_for_account(job["job_id"], worker_id, detail)
+                        else:
+                            _creative_release_worker(worker_id, "IDLE", detail)
+                        return
+                    global _CREATIVE_FLOW_ADAPTER
+                    if _CREATIVE_FLOW_ADAPTER is None:
+                        _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+                    adapter = _CREATIVE_FLOW_ADAPTER
+                else:
+                    adapter = _CREATIVE_ZIMAGE_ADAPTER
+                contract = adapter.run(dict(job), worker_id, account_id)
+            elif stage in ("DEPTH", "MOTION"):
+                # No fake video backend: these stages stay retry/failed until a real
+                # backend is installed. Image-only projects never enqueue them.
+                raise CreativeFlowUnavailable(
+                    f"{stage} backend chưa được cấu hình cho media_type={job.get('metadata_json')}"
+                )
+            elif stage in ("POSTPROCESS", "CLEAN_MAX_VIP", "QC"):
+                contract = _creative_stage_worker_run(dict(job), worker_id)
+                _creative_cmd("CREATIVE", "DONE", job=job["job_id"], stage=stage)
+                return
+            elif stage == "TIMELINE":
+                raise CreativeFlowUnavailable("TIMELINE backend chưa được cấu hình.")
+            else:
+                raise CreativeInvalidRequest(f"Stage không hỗ trợ: {stage}")
+
+            ok, reason = _creative_verify_output_contract(
+                contract, job["project_id"], job["scene_id"]
+            )
+            if not ok:
+                raise CreativeFlowUnavailable(reason)
+            _creative_mark_done(
+                job["job_id"], _creative_json(contract, "{}"), contract.get("engine")
+            )
+            if account_id:
+                _creative_quota_update(account_id, usage_delta=1, quota=None, success=True)
+            _creative_release_worker(worker_id, "IDLE")
+            if account_id:
+                _creative_release_account(account_id, success=True)
+            _creative_cmd("CREATIVE", "DONE", job=job["job_id"], engine=contract.get("engine"))
+        except CreativeCaptchaError as exc:
+            if account_id:
+                _creative_record_captcha(account_id, job["job_id"], job["scene_id"], str(exc))
+            else:
+                _creative_retry_v3(job["job_id"], "CAPTCHA", str(exc), None, allow_fallback=False)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeRateLimited as exc:
+            _creative_retry_v3(job["job_id"], "RATE_LIMITED", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeQuotaExceeded as exc:
+            _creative_retry_v3(job["job_id"], "QUOTA", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeAuthError as exc:
+            _creative_retry_v3(job["job_id"], "AUTH_ERROR", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeInvalidRequest as exc:
+            _creative_retry_v3(job["job_id"], "INVALID_REQUEST", str(exc), account_id, allow_fallback=False)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeFlowTimeout as exc:
+            _creative_retry_v3(job["job_id"], "TIMEOUT", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeNetworkError as exc:
+            _creative_retry_v3(job["job_id"], "NETWORK_ERROR", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except CreativeFlowUnavailable as exc:
+            _creative_retry_v3(job["job_id"], "FLOW_UNAVAILABLE", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        except Exception as exc:
+            _creative_retry_v3(job["job_id"], "NETWORK_ERROR", str(exc), account_id)
+            _creative_release_worker(worker_id, "IDLE", str(exc))
+        finally:
+            if account_id:
+                with _batch_db() as db:
+                    row = db.execute(
+                        "SELECT status FROM creative_accounts WHERE account_id=?",
+                        (account_id,),
+                    ).fetchone()
+                if row and row[0] == "BUSY":
+                    _creative_release_account(account_id, success=False)
+    with _CREATIVE_RUNTIME_LOCK:
+        old = _CREATIVE_WORKER_THREADS.get(worker_id)
+        if old and old.is_alive():
+            return old
+        th = threading.Thread(
+            target=runner, name=f"CreativeWorker-{worker_id}", daemon=True
+        )
+        _CREATIVE_WORKER_THREADS[worker_id] = th
+        th.start()
+        return th
+
+_creative_dispatch_worker = _creative_dispatch_worker_v7
+
+# ---------- Canonical scheduler / workers ----------
+
+def _creative_scheduler_dispatch_v7(project):
+    project = _batch_project_name(project)
+    _creative_v3_migrate()
+    _creative_refresh_cooldowns()
+    state = _creative_control_state(project)
+    _creative_recover_v3(project)
+    if state in {"PAUSED", "STOPPING", "STOPPED"}:
+        return False
+    _creative_reconcile_dependencies(project)
+    with _batch_db() as db:
+        workers = db.execute(
+            "SELECT worker_id,status FROM creative_workers "
+            "WHERE status='IDLE' AND stop_requested=0 ORDER BY worker_id"
+        ).fetchall()
+    for w in workers:
+        if _creative_control_state(project) != "RUNNING":
+            break
+        picked = _creative_scheduler_pick(project)
+        if not picked:
+            break
+        job = _creative_atomic_claim_job(project, w["worker_id"])
+        if job:
+            _creative_dispatch_worker(w["worker_id"], job)
+    return True
+
+_creative_scheduler_dispatch = _creative_scheduler_dispatch_v7
+
+def _creative_start_workers_v7(project, count=2, worker_type="FLOW"):
+    _creative_v3_migrate()
+    count = max(1, int(count or 1))
+    ids = [
+        f"{str(worker_type).upper()}-W{i:02d}"
+        for i in range(1, count + 1)
+    ]
+    for wid in ids:
+        _creative_worker_register(wid, str(worker_type).upper())
+    _creative_start_scheduler(project)
+    return ids
+
+_creative_start_workers = _creative_start_workers_v7
+
+# ---------- Project-scoped stop ----------
+
+def _creative_request_stop_workers_v7(project):
+    _creative_v3_migrate()
+    project = _batch_project_name(project)
+    now = _creative_now()
+    with _batch_db() as db:
+        # Do not globally stop idle workers belonging to another Project.
+        db.execute(
+            """UPDATE creative_jobs
+               SET cancel_requested=1,control_state='STOPPING',updated_at=?
+               WHERE project_id=? AND status='RUNNING'""",
+            (now, project),
+        )
+        db.execute(
+            """UPDATE creative_workers
+               SET stop_requested=1,updated_at=?
+               WHERE worker_id IN (
+                   SELECT worker_id FROM creative_jobs
+                   WHERE project_id=? AND status='RUNNING' AND worker_id IS NOT NULL
+               )""",
+            (now, project),
+        )
+
+_creative_request_stop_workers = _creative_request_stop_workers_v7
+
+def _creative_stop_v7(project):
+    project = _batch_project_name(project)
+    _creative_set_control(project, "STOPPING", "Người dùng dừng hàng đợi.")
+    _creative_request_stop_workers(project)
+    _creative_stop_scheduler(project)
+    return True
+
+_creative_stop = _creative_stop_v7
+
+def _creative_resume_v7(project):
+    project = _batch_project_name(project)
+    _creative_clear_stop_workers()
+    _creative_set_control(project, "RUNNING", "Tiếp tục sau STOP/PAUSE.")
+    _creative_reconcile_dependencies(project)
+    _creative_start_scheduler(project)
+    return True
+
+_creative_resume = _creative_resume_v7
+
+# ---------- Master Full waits for the complete image-only creative chain ----------
+
+def _master_zimage_after_prompt_ui_v7(project, handoff_status):
+    marker_text = str(handoff_status or "")
+    if "MASTER_Z-IMAGE-TURBO_GATE_OK" not in marker_text:
+        yield _workflow_progress_card(
+            "⏳ ĐANG CHỜ GEMINI VERIFY — chưa tạo Job hình ảnh.", 100, "gemini"
+        )
+        return
+    if _master_is_stopped():
+        yield _workflow_progress_card(
+            "⏹ MASTER đã dừng — chưa dispatch Job.", 100, "zimage"
+        )
+        return
+    project = _batch_project_name(project)
+    scenes = load_manifest(project)
+    if not scenes:
+        yield _workflow_progress_card("⛔ Không có Scene để tạo Job.", 100, "zimage")
+        return
+
+    _creative_master_full(project, scenes, CREATIVE_ENGINE_AUTO, start=True)
+    workflow_cmd_log(
+        "MASTER", "CREATIVE_JOBS_CREATED",
+        project=project, scene_count=len(scenes), requested_engine="AUTO"
+    )
+
+    expected = []
+    for scene in scenes:
+        if scene_media_type(scene, "image") == "image":
+            expected.append(str(scene.get("scene_id") or "").strip())
+    expected = [x for x in expected if x]
+    total = len(expected)
+
+    deadline = time.monotonic() + max(
+        300, int(os.getenv("VHUNG_MASTER_IMAGE_TIMEOUT", "86400") or 86400)
+    )
+    while time.monotonic() < deadline:
+        if _master_is_stopped():
+            _creative_stop(project)
+            yield _workflow_progress_card(
+                "⏹ MASTER đã dừng — Job Engine giữ nguyên checkpoint.", 0, "zimage"
+            )
+            return
+        with _batch_db() as db:
+            rows = db.execute(
+                """SELECT scene_id,stage,status FROM creative_jobs
+                   WHERE project_id=? AND scene_id IN (%s)"""
+                % (",".join("?" for _ in expected) or "''"),
+                [project, *expected],
+            ).fetchall() if expected else []
+        done = sum(
+            1 for r in rows
+            if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"] == "DONE"
+        )
+        failed = sum(
+            1 for r in rows
+            if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"] == "FAILED"
+        )
+        captcha = sum(
+            1 for r in rows
+            if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"] == "CAPTCHA"
+        )
+        running = sum(
+            1 for r in rows
+            if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"] == "RUNNING"
+        )
+        active_total = total * len(CREATIVE_IMAGE_ONLY_STAGES)
+        pct = int(min(99, (done / active_total) * 100)) if active_total else 100
+        yield _workflow_progress_card(
+            f"CREATIVE: DONE {done}/{active_total} · RUN {running} · CAPTCHA {captcha} · FAIL {failed}",
+            pct, "zimage"
+        )
+        if active_total and done >= active_total:
+            workflow_cmd_log(
+                "MASTER", "CREATIVE_COMPLETE_QC_UNLOCK",
+                project=project, scene_count=total
+            )
+            yield _workflow_progress_card(
+                f"🟢 IMAGE → POSTPROCESS → CLEAN → QC hoàn tất · {total} Scene.",
+                100, "zimage"
+            ) + "\n\n[MASTER_ZIMAGE_OK]"
+            return
+        if failed:
+            workflow_cmd_log(
+                "MASTER", "CREATIVE_PIPELINE_FAILED",
+                project=project, failed=failed, level="ERROR"
+            )
+            yield _workflow_progress_card(
+                f"⛔ Creative pipeline có {failed} Job FAILED.", 100, "zimage"
+            )
+            return
+        time.sleep(1.0)
+
+    yield _workflow_progress_card(
+        "⛔ Hết thời gian chờ Creative Job Engine.", 100, "zimage"
+    )
+
+_master_zimage_after_prompt_ui = _master_zimage_after_prompt_ui_v7
+
+# Clean UI text: production path is Hình ảnh/ZImage, legacy FluxJS only exists
+# in migration code and is never used as an engine.
+
 def launch_ui():
     _cleanup_gradio_temp(force=True)
     workflow_cmd_log('SUPERVISOR', 'STARTUP_HEALTH', project='', health=background_health_snapshot())
@@ -17577,7 +18357,7 @@ def launch_ui():
             [batch_hud, batch_jobs], show_progress='hidden'
         )
 
-        gr.Markdown(f'**{APP_DISPLAY_NAME}:** toàn bộ dữ liệu tạo ra của từng Project được lưu trong thư mục Project bạn đã chọn: Script / Scenes / Prompts / Audio / Images / FluxJS / Output / QC / Timeline / CapCut...')
+        gr.Markdown(f'**{APP_DISPLAY_NAME}:** toàn bộ dữ liệu tạo ra của từng Project được lưu trong thư mục Project bạn đã chọn: Script / Scenes / Prompts / Audio / Images / ZImage / Output / QC / Timeline / CapCut...')
 
     return ui
 
