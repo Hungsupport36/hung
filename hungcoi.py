@@ -19630,6 +19630,279 @@ def cleanup_completed_projects_on_shutdown():
                 cleanup_intermediate_project_files(name)
     except Exception:
         pass
+
+# ============================================================
+# V11.5.1 — GOOGLE FLOW REAL WORKER UI CONTROL
+# ============================================================
+
+_FLOW_ACCOUNT_LOCKS = {}
+_FLOW_ACCOUNT_LOCKS_GUARD = threading.RLock()
+
+def _flow_account_serial_lock(account_id):
+    aid = str(account_id or "").strip()
+    with _FLOW_ACCOUNT_LOCKS_GUARD:
+        return _FLOW_ACCOUNT_LOCKS.setdefault(aid, threading.RLock())
+
+def _flow_page_has_captcha(page):
+    try:
+        text = (page.locator("body").inner_text(timeout=1500) or "").lower()
+        return any(k in text for k in ("captcha","verify you are human","unusual traffic","security check"))
+    except Exception:
+        return False
+
+def _flow_thread_context(self, account_id):
+    """Fresh Sync Playwright connection in the current Creative worker thread."""
+    aid = str(account_id or "").strip()
+    row = _creative_get_account(aid)
+    if not row:
+        raise CreativeAuthError(f"Flow Account không tồn tại: {aid}")
+    profile = str(row.get("session_profile") or "").strip()
+    if not profile:
+        raise CreativeAuthError(f"{aid} chưa có session_profile.")
+    ok, detail = _playwright_chrome_runtime_check()
+    if not ok:
+        raise CreativeFlowUnavailable(detail)
+    port = int(row.get("debug_port") or _flow_debug_port(aid))
+    if not _flow_cdp_ready(port, timeout=2):
+        p = Path(profile).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        workflow_cmd_log("FLOW_POOL","WORKER_PROFILE_REOPEN",account_id=aid,profile=str(p))
+        _flow_launch_stable_chrome(aid, str(p), self.FLOW_URL)
+        if not _flow_cdp_ready(port, timeout=15):
+            raise CreativeFlowUnavailable(f"Chrome Stable đã mở lại nhưng CDP chưa sẵn sàng: {aid}")
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("Flow Sync Playwright phải chạy trong worker thread, không chạy trong asyncio callback.")
+    from playwright.sync_api import sync_playwright
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=15000)
+        contexts = browser.contexts
+        if not contexts:
+            raise CreativeFlowUnavailable(f"Chrome CDP không có BrowserContext: {aid}")
+        context = contexts[0]
+        pages = [p for p in context.pages if not p.is_closed()]
+        page = next(
+            (p for p in pages if "labs.google" in str(p.url or "").lower()
+             or "flow" in str(p.url or "").lower()),
+            pages[0] if pages else context.new_page(),
+        )
+        try:
+            page.bring_to_front()
+        except Exception:
+            pass
+        if "labs.google" not in str(page.url or "").lower() and "flow" not in str(page.url or "").lower():
+            page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+        try:
+            page.wait_for_load_state("domcontentloaded", timeout=15000)
+        except Exception:
+            pass
+        workflow_cmd_log("FLOW","WORKER_SESSION_ATTACHED",account_id=aid,port=port,url=str(page.url or "")[:500])
+        return pw, browser, page
+    except Exception:
+        try:
+            pw.stop()
+        except Exception:
+            pass
+        raise
+
+GoogleFlowAdapter._context = _flow_thread_context
+
+def _flow_find_prompt_box(page, timeout=30):
+    deadline = time.monotonic() + max(5, int(timeout))
+    selectors = ["textarea","[contenteditable='true']","[role='textbox']","input[type='text']"]
+    while time.monotonic() < deadline:
+        if _flow_page_has_captcha(page):
+            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                for i in range(loc.count()-1,-1,-1):
+                    item = loc.nth(i)
+                    if item.is_visible() and item.is_enabled():
+                        return item
+            except Exception:
+                pass
+        # First-run recovery: if Flow opened at the project picker and no prompt
+        # exists, create one project. It is never done once a prompt box exists.
+        try:
+            for label in ("New project","+ New project","New"):
+                btn = page.get_by_role("button", name=re.compile(re.escape(label),re.I)).last
+                if btn.count() and btn.is_visible() and btn.is_enabled():
+                    btn.click()
+                    workflow_cmd_log("FLOW","NEW_PROJECT_CREATED",reason="prompt_box_missing")
+                    break
+        except Exception:
+            pass
+        time.sleep(0.5)
+    try:
+        body=(page.locator("body").inner_text(timeout=2000) or "")[:1200]
+    except Exception:
+        body=""
+    raise CreativeFlowUnavailable(f"Không tìm thấy Prompt Box Google Flow sau 30s · url={str(page.url or '')[:300]} · body={body!r}")
+
+def _flow_click_generate_image(page):
+    for pat in (r"^Generate Image$",r"Generate Image",r"^Generate$",r"Create Image"):
+        try:
+            btn=page.get_by_role("button",name=re.compile(pat,re.I)).last
+            if btn.count() and btn.is_visible() and btn.is_enabled():
+                btn.scroll_into_view_if_needed()
+                btn.click(timeout=5000)
+                return True
+        except Exception:
+            pass
+    try:
+        buttons=page.locator("button")
+        for i in range(buttons.count()-1,-1,-1):
+            b=buttons.nth(i)
+            if not b.is_visible() or not b.is_enabled():
+                continue
+            label=" ".join(filter(None,[b.inner_text(timeout=300),b.get_attribute("aria-label"),b.get_attribute("title")]))
+            if re.search(r"generate\s*image|create\s*image",label,re.I):
+                b.click(timeout=5000)
+                return True
+    except Exception:
+        pass
+    return False
+
+def _flow_download_latest_asset(page,before_img_count,timeout=900):
+    """Wait for the generated asset and click Flow's visible Download control."""
+    deadline=time.monotonic()+max(30,int(timeout))
+    while time.monotonic()<deadline:
+        if _flow_page_has_captcha(page):
+            raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+        try:
+            imgs=page.locator("img"); img_count=imgs.count()
+        except Exception:
+            imgs=None; img_count=before_img_count
+
+        for sel in ("[aria-label*='download' i]","[title*='download' i]","[data-testid*='download' i]","a[download]","a[href*='download' i]"):
+            try:
+                loc=page.locator(sel)
+                for i in range(loc.count()-1,-1,-1):
+                    item=loc.nth(i)
+                    if not item.is_visible():
+                        continue
+                    try:
+                        with page.expect_download(timeout=3000) as info:
+                            item.click(timeout=2000)
+                        return info.value
+                    except Exception:
+                        continue
+            except Exception:
+                pass
+
+        if imgs is not None and img_count>before_img_count:
+            for i in range(img_count-1,max(-1,img_count-10),-1):
+                try:
+                    img=imgs.nth(i)
+                    if not img.is_visible():
+                        continue
+                    img.scroll_into_view_if_needed(); img.hover(timeout=2000)
+                    parent=img.locator("xpath=ancestor::*[.//img][1]")
+                    controls=parent.locator("button,[role='button']")
+                    for j in range(controls.count()-1,-1,-1):
+                        c=controls.nth(j)
+                        if not c.is_visible():
+                            continue
+                        label=" ".join(filter(None,[c.inner_text(timeout=200),c.get_attribute("aria-label"),c.get_attribute("title")]))
+                        if re.search(r"more|options",label,re.I):
+                            try:
+                                c.click(timeout=2000)
+                                menu=page.get_by_role("menuitem",name=re.compile(r"download",re.I)).last
+                                if menu.count() and menu.is_visible():
+                                    with page.expect_download(timeout=10000) as info:
+                                        menu.click(timeout=3000)
+                                    return info.value
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        try:
+            dl=page.get_by_text(re.compile(r"^Download$",re.I)).last
+            if dl.count() and dl.is_visible():
+                with page.expect_download(timeout=5000) as info:
+                    dl.click(timeout=3000)
+                return info.value
+        except Exception:
+            pass
+        time.sleep(CREATIVE_FLOW_POLL_SECONDS)
+    raise CreativeFlowTimeout(f"Google Flow đã nhận Generate nhưng chưa có Download sau {timeout}s.")
+
+def _flow_run_real_v115(self,job,worker_id,account_id=None):
+    if not account_id:
+        raise CreativeAuthError("Flow Job chưa có Account.")
+    with _flow_account_serial_lock(account_id):
+        pw=None
+        try:
+            _creative_set_actual_engine(job["job_id"],CREATIVE_ENGINE_FLOW)
+            _creative_heartbeat(worker_id,job["job_id"])
+            pw,browser,page=_flow_thread_context(self,account_id)
+            if _flow_page_has_captcha(page):
+                raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+            meta=_creative_load_json(job.get("metadata_json") or "{}",{})
+            prompt=str(meta.get("prompt") or meta.get("image_prompt") or meta.get("visual_prompt") or "").strip()
+            if not prompt:
+                raise CreativeInvalidRequest(f"{job.get('job_id')} không có scene prompt.")
+
+            workflow_cmd_log("FLOW","PROMPT_IMPORT_START",account_id=account_id,scene=job.get("scene_id"),prompt_chars=len(prompt))
+            box=_flow_find_prompt_box(page,30)
+            box.click()
+            try: box.press("Control+A")
+            except Exception: pass
+            box.fill(prompt)
+            workflow_cmd_log("FLOW","PROMPT_IMPORTED",account_id=account_id,scene=job.get("scene_id"))
+            try: box.press("Control+Enter")
+            except Exception: pass
+            if _flow_page_has_captcha(page):
+                raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+            try: before_img_count=page.locator("img").count()
+            except Exception: before_img_count=0
+            if not _flow_click_generate_image(page):
+                raise CreativeFlowUnavailable("Không tìm thấy nút Generate Image của Google Flow.")
+            workflow_cmd_log("FLOW","GENERATE_CLICKED",account_id=account_id,scene=job.get("scene_id"))
+            _creative_heartbeat(worker_id,job["job_id"])
+            download=_flow_download_latest_asset(page,before_img_count,CREATIVE_FLOW_RESULT_TIMEOUT)
+
+            out_dir=_project_image_dir(project_dir(job["project_id"]))
+            out_dir.mkdir(parents=True,exist_ok=True)
+            out=out_dir/f"{job['scene_id']}.png"
+            download.save_as(str(out))
+            try:
+                from PIL import Image
+                with Image.open(out) as im:
+                    im.load()
+                    if im.size!=(CREATIVE_IMAGE_WIDTH,CREATIVE_IMAGE_HEIGHT):
+                        im=im.convert("RGB").resize((CREATIVE_IMAGE_WIDTH,CREATIVE_IMAGE_HEIGHT),Image.Resampling.LANCZOS)
+                        im.save(out,format="PNG",optimize=True)
+            except Exception as exc:
+                raise CreativeFlowUnavailable(f"Không normalize được Flow output: {exc}")
+            workflow_cmd_log("FLOW","SCENE_OUTPUT_SAVED",account_id=account_id,scene=job.get("scene_id"),output=str(out),width=CREATIVE_IMAGE_WIDTH,height=CREATIVE_IMAGE_HEIGHT)
+            return _creative_output_contract(job,out,CREATIVE_ENGINE_FLOW,account_id,worker_id)
+        except Exception as exc:
+            workflow_cmd_log("FLOW","SCENE_FAILED",account_id=account_id,scene=job.get("scene_id"),error=str(exc)[:1800],level="ERROR")
+            raise
+        finally:
+            # Release only this worker's Playwright connection. Do not close the
+            # remote Stable Chrome process/profile.
+            try:
+                if pw is not None: pw.stop()
+            except Exception:
+                pass
+
+GoogleFlowAdapter.run=_flow_run_real_v115
+
+_CREATIVE_START_WORKERS_ORIGINAL_V115=globals().get("_creative_start_workers")
+def _creative_start_workers(project,count=2,worker_type="FLOW"):
+    if str(worker_type).upper()=="FLOW":
+        count=1
+    return _CREATIVE_START_WORKERS_ORIGINAL_V115(project,count=count,worker_type=worker_type)
+
+
 if __name__ == '__main__':
     import argparse
     if os.name == 'nt':
