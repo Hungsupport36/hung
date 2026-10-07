@@ -1145,6 +1145,7 @@ def _creative_find_existing_scene_output(project, scene_id):
     return None
 
 
+# V11.6: Flow execution uses installed Chrome Stable over CDP; Playwright is only the controller.
 class GoogleFlowAdapter(CreativeEngineAdapter):
     """Playwright-backed Flow adapter. CAPTCHA is detected, never bypassed."""
     FLOW_URL = os.getenv("VHUNG_GOOGLE_FLOW_URL", "https://labs.google/fx/tools/flow")
@@ -1153,21 +1154,63 @@ class GoogleFlowAdapter(CreativeEngineAdapter):
         self._contexts = {}
 
     def _context(self, account_id):
+        """Connect Playwright to the tool-owned Google Chrome Stable profile.
+
+        IMPORTANT: this never launches Playwright/Chromium. Chrome is launched
+        separately with a deterministic CDP port and the verified Flow profile.
+        The Playwright controller belongs exclusively to the calling worker
+        thread and is disconnected by _flow_run_v7 when that scene finishes.
+        """
         try:
+            _playwright_prepare_runtime()
             from playwright.sync_api import sync_playwright
         except Exception as exc:
-            raise RuntimeError(f"Thiếu Playwright: {exc}")
+            raise RuntimeError(f"Thiếu Playwright runtime: {exc}")
+
         account_dir = APP_STATE_DIR / "flow_profiles" / safe_name(account_id)
-        account_dir.mkdir(parents=True, exist_ok=True)
-        item = self._contexts.get(account_id)
-        if item:
-            return item
+        row = _creative_get_account(account_id) if callable(globals().get("_creative_get_account")) else None
+        profile = str((row or {}).get("session_profile") or account_dir).strip()
+        port = int((row or {}).get("debug_port") or _flow_debug_port(account_id))
+
+        if not _flow_cdp_ready(port, timeout=2):
+            try:
+                _flow_launch_stable_chrome(account_id, profile, self.FLOW_URL)
+            except Exception as exc:
+                raise RuntimeError(f"Không mở được Chrome Stable cho {account_id}: {exc}")
+            if not _flow_cdp_ready(port, timeout=15):
+                raise RuntimeError(
+                    f"Chrome Stable đã mở nhưng CDP chưa sẵn sàng · Account={account_id} · Port={port}"
+                )
+
         pw = sync_playwright().start()
-        browser = pw.chromium.launch_persistent_context(str(account_dir), headless=False)
-        page = browser.pages[0] if browser.pages else browser.new_page()
-        page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
-        self._contexts[account_id] = (pw, browser, page)
-        return self._contexts[account_id]
+        try:
+            browser = pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}", timeout=15000
+            )
+            contexts = browser.contexts
+            if not contexts:
+                raise RuntimeError("Chrome CDP connected nhưng không có BrowserContext.")
+            context = contexts[0]
+            pages = context.pages
+            page = None
+            for candidate in pages:
+                try:
+                    if "flow" in str(candidate.url or "").lower():
+                        page = candidate
+                        break
+                except Exception:
+                    pass
+            if page is None:
+                page = pages[0] if pages else context.new_page()
+            if "flow" not in str(page.url or "").lower():
+                page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+            return pw, browser, page
+        except Exception:
+            try:
+                pw.stop()
+            except Exception:
+                pass
+            raise
 
     @staticmethod
     def _captcha_visible(page):
@@ -13918,119 +13961,134 @@ def _flow_wait_for_result_download(self, page, worker_id, job_id):
     )
 
 def _flow_run_v7(self, job, worker_id, account_id=None):
-    """Real Flow image worker: open/reopen profile, import prompt, Generate,
-    wait for the normal Download control, save and verify the image.
+    """Run exactly one real Google Flow scene through the verified Chrome profile.
+
+    Sequence:
+      open/reconnect verified Chrome profile
+      -> ensure/open Flow project
+      -> locate the real scene composer
+      -> paste Scene prompt
+      -> click the real Generate control
+      -> wait for Flow's real Download control
+      -> save Hình ảnh/Scene_xxx.png
+      -> verify the output contract
+
+    No arbitrary page-button click and no Playwright-managed Chromium.
     """
     if not account_id:
         raise CreativeAuthError("Flow Job chưa có Account.")
+
     jid = str(job.get("job_id") or "")
     sid = str(job.get("scene_id") or "")
+    lock = None
+    with _FLOW_ACCOUNT_LOCKS_GUARD:
+        lock = _FLOW_ACCOUNT_LOCKS.setdefault(str(account_id), threading.Lock())
+
+    if not lock.acquire(blocking=False):
+        raise CreativeFlowUnavailable(
+            f"Flow profile {account_id} đang được Scene khác sử dụng — không chạy song song."
+        )
+
     _creative_heartbeat(worker_id, jid)
     pw = browser = page = None
     try:
-        workflow_cmd_log("FLOW", "IMAGE_START", worker_id=worker_id,
-                         account_id=account_id, scene_id=sid)
+        workflow_cmd_log(
+            "FLOW", "IMAGE_START", worker_id=worker_id,
+            account_id=account_id, scene_id=sid
+        )
+
         try:
             pw, browser, page = self._context(account_id)
         except Exception as exc:
             raise CreativeFlowUnavailable(
-                f"Không mở/reopen được Session Flow {account_id}: {exc}"
+                f"Không mở/reopen được Chrome Stable + CDP cho {account_id}: {exc}"
             )
+
         if self._captcha_visible(page):
             raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
 
         meta = _creative_load_json(job.get("metadata_json") or "{}", {})
-        prompt = str(meta.get("prompt") or meta.get("image_prompt") or "").strip()
+        prompt = str(
+            meta.get("prompt") or meta.get("image_prompt") or ""
+        ).strip()
         if not prompt:
-            raise CreativeInvalidRequest(f"Job Flow {jid} không có prompt scene {sid}.")
+            raise CreativeInvalidRequest(
+                f"Job Flow {jid} không có prompt scene {sid}."
+            )
 
-        box = page.get_by_role("textbox").last
-        if not box.count():
-            box = page.locator(
-                "textarea, [contenteditable='true'], input[type='text']"
-            ).last
-        if not box.count():
-            raise CreativeFlowUnavailable("Không tìm thấy ô Prompt Google Flow.")
-        box.click()
+        # This helper owns the project-creation/reuse step. It does not create
+        # a new Flow project for every scene when the current project is already open.
+        box = _flow_find_prompt_box(page, timeout=45)
+        try:
+            box.click(timeout=5000)
+        except Exception:
+            pass
         try:
             box.fill("")
         except Exception:
             pass
         box.fill(prompt)
-        workflow_cmd_log("FLOW", "PROMPT_IMPORTED", worker_id=worker_id,
-                         account_id=account_id, scene_id=sid)
+
+        workflow_cmd_log(
+            "FLOW", "PROMPT_IMPORTED", worker_id=worker_id,
+            account_id=account_id, scene_id=sid
+        )
 
         if self._captcha_visible(page):
             raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
 
-        submitted = False
-        buttons = page.get_by_role("button")
-        for label in (
-            "Generate", "Create", "Run", "Tạo", "Generate image",
-            "Create image", "Generate images", "Create images"
-        ):
-            try:
-                loc = buttons.filter(has_text=label)
-                if loc.count():
-                    btn = loc.last
-                    if btn.is_visible() and btn.is_enabled():
-                        btn.click(timeout=5000)
-                        submitted = True
-                        break
-            except Exception:
-                continue
+        try:
+            before_img_count = page.locator("img").count()
+        except Exception:
+            before_img_count = 0
 
-        if not submitted:
-            for i in range(max(0, buttons.count() - 12), buttons.count()):
-                try:
-                    btn = buttons.nth(i)
-                    if not btn.is_visible() or not btn.is_enabled():
-                        continue
-                    label = (
-                        (btn.inner_text(timeout=700) or "") + " " +
-                        (btn.get_attribute("aria-label") or "") + " " +
-                        (btn.get_attribute("title") or "")
-                    ).strip().lower()
-                    if any(k in label for k in (
-                        "generate", "create", "run", "tạo", "generate image"
-                    )) and not any(k in label for k in (
-                        "captcha", "verify", "security", "sign out", "logout"
-                    )):
-                        btn.click(timeout=5000)
-                        submitted = True
-                        break
-                except Exception:
-                    continue
-        if not submitted:
+        # Use the hardened Flow resolver already present in this build:
+        # exact Generate/Create first, then composer-local evidence, then only
+        # a generation-state-confirmed keyboard submit.
+        if not _flow_click_generate_image(
+            page, prompt_box=box, before_img_count=before_img_count
+        ):
             raise CreativeFlowUnavailable(
-                "Đã mở đúng Flow Profile nhưng không tìm thấy nút Generate/Create."
+                "Đã nhập Prompt nhưng Google Flow không xác nhận được nút Generate/Create."
             )
 
-        workflow_cmd_log("FLOW", "GENERATE_CLICKED", worker_id=worker_id,
-                         account_id=account_id, scene_id=sid)
+        workflow_cmd_log(
+            "FLOW", "GENERATE_CLICKED", worker_id=worker_id,
+            account_id=account_id, scene_id=sid
+        )
         _creative_heartbeat(worker_id, jid)
 
-        download = self._wait_for_result_download(page, worker_id, jid)
+        download = _flow_wait_for_result_download(
+            self, page, worker_id, jid
+        )
+
         out_dir = _project_image_dir(project_dir(job["project_id"]))
         out_dir.mkdir(parents=True, exist_ok=True)
         out = out_dir / f"{sid}.png"
         download.save_as(str(out))
+
         if not out.is_file() or out.stat().st_size <= 0:
             raise CreativeFlowUnavailable(
                 f"Flow Download xong nhưng file {sid}.png không hợp lệ."
             )
-        workflow_cmd_log("FLOW", "IMAGE_DOWNLOADED", worker_id=worker_id,
-                         account_id=account_id, scene_id=sid, output=str(out))
+
+        workflow_cmd_log(
+            "FLOW", "IMAGE_DOWNLOADED", worker_id=worker_id,
+            account_id=account_id, scene_id=sid, output=str(out)
+        )
+
         return _creative_output_contract(
             job, out, CREATIVE_ENGINE_FLOW, account_id, worker_id
         )
     finally:
-        # Keep Chrome/Profile alive. Only destroy this thread's Playwright controller.
+        # Never close Chrome or its verified profile here. Only disconnect this
+        # worker's Playwright controller; the next scene reconnects through CDP.
         if pw is not None:
             try:
                 pw.stop()
             except Exception:
                 pass
+        lock.release()
 
 GoogleFlowAdapter._wait_for_result_download = _flow_wait_for_result_download
 GoogleFlowAdapter.run = _flow_run_v7
