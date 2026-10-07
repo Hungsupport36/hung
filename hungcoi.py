@@ -14708,8 +14708,8 @@ def _creative_flow_manual_profile_open(profile_path=""):
     except Exception as exc:
         return _creative_account_pool_html(), f"🔴 Không mở được Profile: {str(exc)[:1000]}", ""
 
-def _creative_flow_manual_profile_verify(account_id):
-    """Verify manual login, persist session state, and activate the profile."""
+def _creative_flow_manual_profile_verify_sync(account_id):
+    """Run the real Flow VERIFY entirely outside Gradio's asyncio event loop."""
     aid = str(account_id or "").strip()
     if not aid:
         return _creative_account_pool_html(), "🔴 Chưa có Profile/Account đang kiểm tra."
@@ -14721,6 +14721,8 @@ def _creative_flow_manual_profile_verify(account_id):
         global _CREATIVE_FLOW_ADAPTER
         if _CREATIVE_FLOW_ADAPTER is None:
             _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        # IMPORTANT: every Playwright Sync API operation below stays in this
+        # dedicated worker thread, never in Gradio's asyncio event-loop thread.
         pw, browser, page = _CREATIVE_FLOW_ADAPTER._context(aid)
         result = _CREATIVE_FLOW_ADAPTER.health_check(aid)
         ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
@@ -14750,6 +14752,20 @@ def _creative_flow_manual_profile_verify(account_id):
     except Exception as exc:
         _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
         return _creative_account_pool_html(), f"🔴 VERIFY PROFILE lỗi {aid}: {str(exc)[:1000]}"
+
+_FLOW_VERIFY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="VHUNG-FlowVerify"
+)
+
+async def _creative_flow_manual_profile_verify(account_id):
+    """Async UI callback; delegate all Playwright Sync API work to a real thread."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(
+        _FLOW_VERIFY_EXECUTOR,
+        lambda: contextvars.copy_context().run(
+            _creative_flow_manual_profile_verify_sync, account_id
+        ),
+    )
 
 def _creative_account_pool_html(limit=100):
     """Render account pool with local profile/identity state."""
