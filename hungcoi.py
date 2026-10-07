@@ -19775,92 +19775,202 @@ def _flow_thread_context(self, account_id):
 
 GoogleFlowAdapter._context = _flow_thread_context
 
-def _flow_create_project(page, timeout=45):
-    """Mirror the old Creative Studio browser sequence: open/create a Flow project before prompt entry."""
-    deadline = time.monotonic() + max(10, int(timeout))
-    # If the prompt composer is already visible, we are already inside a project.
-    selectors = ["textarea", "[contenteditable='true']", "[role='textbox']"]
+def _flow_prompt_box_visible(page):
+    """Return True only when Flow's actual scene composer is visible."""
+    selectors = ("textarea", "[contenteditable='true']")
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(loc.count() - 1, -1, -1):
+                el = loc.nth(i)
+                if not el.is_visible() or not el.is_enabled():
+                    continue
+                attrs = []
+                for name in ("placeholder", "aria-label", "data-placeholder", "name", "data-testid"):
+                    try:
+                        v = el.get_attribute(name)
+                        if v:
+                            attrs.append(str(v))
+                    except Exception:
+                        pass
+                label = " ".join(attrs).lower()
+                if any(k in label for k in (
+                    "prompt", "describe", "image", "what do you want",
+                    "enter a prompt", "type a prompt", "mô tả", "nhập"
+                )):
+                    return True
+                # Flow's composer is normally a textarea/contenteditable; only
+                # accept an unlabeled control when it has a nearby generation
+                # control. This avoids mistaking account/search/navigation boxes.
+                try:
+                    parent = el.locator(
+                        "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
+                    )
+                    controls = parent.locator("button,[role='button']")
+                    for j in range(controls.count() - 1, -1, -1):
+                        c = controls.nth(j)
+                        if not c.is_visible() or not c.is_enabled():
+                            continue
+                        lab = " ".join(filter(None, (
+                            c.get_attribute("aria-label"),
+                            c.get_attribute("title"),
+                            c.get_attribute("data-testid"),
+                            c.get_attribute("data-tooltip"),
+                            c.get_attribute("data-tooltip-content"),
+                            c.inner_text(timeout=150),
+                        )))
+                        if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?", lab, re.I):
+                            return True
+                except Exception:
+                    pass
+        except Exception:
+            continue
+    return False
+
+
+def _flow_create_project(page, timeout=60):
+    """Reproduce the old Creative Studio sequence: project -> prompt composer."""
+    deadline = time.monotonic() + max(15, int(timeout))
+    if _flow_prompt_box_visible(page):
+        workflow_cmd_log("FLOW", "PROJECT_ALREADY_OPEN")
+        return
+
+    # First prefer the real project/create controls exposed by Flow.
+    project_patterns = (
+        r"^New project$", r"^Create new project$", r"^Create project$",
+        r"^New$", r"^Tạo dự án$", r"^Tạo mới$", r"^Create new$",
+    )
     while time.monotonic() < deadline:
         if _flow_page_has_captcha(page):
             raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
-        for sel in selectors:
-            try:
-                loc = page.locator(sel)
-                if any(loc.nth(i).is_visible() and loc.nth(i).is_enabled()
-                       for i in range(max(0, loc.count()-5), loc.count())):
-                    workflow_cmd_log("FLOW","PROJECT_ALREADY_OPEN")
-                    return
-            except Exception:
-                pass
-        # Old-tool semantics: click the visible New/Create project control, then
-        # confirm the project creation dialog if Flow shows one.
+
         clicked = False
-        for label in (
-            r"^New project$", r"^Create new$", r"^New$", r"^Tạo dự án$",
-            r"^Tạo mới$", r"New project", r"Create project"
-        ):
+        for pat in project_patterns:
             try:
-                btn = page.get_by_role("button", name=re.compile(label, re.I)).last
-                if btn.count() and btn.is_visible() and btn.is_enabled():
-                    btn.scroll_into_view_if_needed()
-                    btn.click(timeout=5000)
-                    workflow_cmd_log("FLOW","CREATE_PROJECT_CLICKED",label=label)
-                    clicked = True
+                loc = page.get_by_role("button", name=re.compile(pat, re.I))
+                for i in range(loc.count() - 1, -1, -1):
+                    btn = loc.nth(i)
+                    if btn.is_visible() and btn.is_enabled():
+                        btn.scroll_into_view_if_needed()
+                        btn.click(timeout=5000)
+                        workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED", label=pat)
+                        clicked = True
+                        break
+                if clicked:
                     break
             except Exception:
                 pass
-        if clicked:
-            # Some Flow builds open a dialog requiring a second Create/Continue.
-            for _ in range(20):
-                for label in (r"^Create$", r"^Continue$", r"^Tạo$", r"^Tiếp tục$"):
-                    try:
-                        btn = page.get_by_role("button", name=re.compile(label, re.I)).last
-                        if btn.count() and btn.is_visible() and btn.is_enabled():
-                            btn.click(timeout=3000)
-                            workflow_cmd_log("FLOW","CREATE_PROJECT_CONFIRMED",label=label)
+
+        # Some builds render the project action as a link/menu item rather than
+        # a button. Use exact visible text only; never click a generic last button.
+        if not clicked:
+            for pat in project_patterns:
+                try:
+                    loc = page.get_by_text(re.compile(pat, re.I))
+                    for i in range(loc.count() - 1, -1, -1):
+                        item = loc.nth(i)
+                        if item.is_visible() and item.is_enabled():
+                            item.click(timeout=5000)
+                            workflow_cmd_log("FLOW", "CREATE_PROJECT_CLICKED_TEXT", label=pat)
+                            clicked = True
                             break
-                    except Exception:
-                        pass
-                time.sleep(0.5)
-                for sel in selectors:
+                    if clicked:
+                        break
+                except Exception:
+                    pass
+
+        if clicked:
+            workflow_cmd_log("FLOW", "CREATE_PROJECT_DIALOG_WAIT")
+            # Confirm only a project-creation dialog, not arbitrary "Create".
+            for _ in range(30):
+                if _flow_page_has_captcha(page):
+                    raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
+                for pat in (r"^Create project$", r"^Create$", r"^Continue$", r"^Tạo$", r"^Tiếp tục$"):
                     try:
-                        loc = page.locator(sel)
-                        for i in range(max(0,loc.count()-5),loc.count()):
-                            item=loc.nth(i)
-                            if item.is_visible() and item.is_enabled():
-                                workflow_cmd_log("FLOW","PROJECT_READY")
-                                return
+                        dialogs = page.get_by_role("dialog")
+                        targets = dialogs.get_by_role("button", name=re.compile(pat, re.I)) if dialogs.count() else page.get_by_role("button", name=re.compile(pat, re.I))
+                        for i in range(targets.count() - 1, -1, -1):
+                            btn = targets.nth(i)
+                            if btn.is_visible() and btn.is_enabled():
+                                btn.click(timeout=3000)
+                                workflow_cmd_log("FLOW", "CREATE_PROJECT_CONFIRMED", label=pat)
+                                break
                     except Exception:
                         pass
+                if _flow_prompt_box_visible(page):
+                    workflow_cmd_log("FLOW", "PROJECT_READY")
+                    return
+                time.sleep(0.5)
         time.sleep(0.5)
-    raise CreativeFlowUnavailable("Không thể mở/tạo Project Google Flow hoặc không xuất hiện ô Prompt.")
+
+    raise CreativeFlowUnavailable(
+        "Không mở/tạo được Project Google Flow hoặc chưa xuất hiện Scene Prompt composer."
+    )
 
 
-def _flow_find_prompt_box(page, timeout=30):
-    _flow_create_project(page, timeout=max(15, int(timeout)))
-    deadline = time.monotonic() + max(5, int(timeout))
-    selectors = ["textarea","[contenteditable='true']","[role='textbox']","input[type='text']"]
+def _flow_find_prompt_box(page, timeout=45):
+    _flow_create_project(page, timeout=max(20, int(timeout)))
+    deadline = time.monotonic() + max(10, int(timeout))
+    selectors = ("textarea", "[contenteditable='true']")
     while time.monotonic() < deadline:
         if _flow_page_has_captcha(page):
             raise CreativeCaptchaError("Google Flow yêu cầu CAPTCHA.")
         for sel in selectors:
             try:
                 loc = page.locator(sel)
-                for i in range(loc.count()-1,-1,-1):
+                for i in range(loc.count() - 1, -1, -1):
                     item = loc.nth(i)
-                    if item.is_visible() and item.is_enabled():
+                    if not item.is_visible() or not item.is_enabled():
+                        continue
+                    attrs = []
+                    for name in ("placeholder", "aria-label", "data-placeholder", "name", "data-testid"):
+                        try:
+                            v = item.get_attribute(name)
+                            if v:
+                                attrs.append(str(v))
+                        except Exception:
+                            pass
+                    label = " ".join(attrs).lower()
+                    if any(k in label for k in (
+                        "prompt", "describe", "image", "what do you want",
+                        "enter a prompt", "type a prompt", "mô tả", "nhập"
+                    )):
                         return item
+                    # If unlabeled, accept only when its composer has a generate
+                    # control. This is the important guard against search fields.
+                    try:
+                        parent = item.locator(
+                            "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
+                        )
+                        controls = parent.locator("button,[role='button']")
+                        for j in range(controls.count() - 1, -1, -1):
+                            c = controls.nth(j)
+                            if not c.is_visible() or not c.is_enabled():
+                                continue
+                            lab = " ".join(filter(None, (
+                                c.get_attribute("aria-label"),
+                                c.get_attribute("title"),
+                                c.get_attribute("data-testid"),
+                                c.get_attribute("data-tooltip"),
+                                c.get_attribute("data-tooltip-content"),
+                                c.inner_text(timeout=150),
+                            )))
+                            if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?", lab, re.I):
+                                return item
+                    except Exception:
+                        pass
             except Exception:
                 pass
-        time.sleep(0.5)
+        time.sleep(0.4)
     try:
-        body=(page.locator("body").inner_text(timeout=2000) or "")[:1200]
+        body = (page.locator("body").inner_text(timeout=2000) or "")[:1600]
     except Exception:
-        body=""
+        body = ""
     raise CreativeFlowUnavailable(
-        f"Không tìm thấy Prompt Box Google Flow sau {timeout}s · "
+        f"Không tìm thấy Scene Prompt composer sau {timeout}s · "
         f"url={str(page.url or '')[:300]} · body={body!r}"
     )
+
 
 def _flow_generation_started(page, before_img_count=0):
     """Best-effort evidence that Flow accepted the submit."""
@@ -19902,12 +20012,12 @@ def _flow_generation_started(page, before_img_count=0):
 
 
 def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
-    """Click Flow's actual image-generation submit control once.
+    """Click only Flow's scene-generation control, then verify submission."""
+    box = prompt_box
+    if box is None:
+        box = _flow_find_prompt_box(page, 10)
 
-    This is deliberately scoped to the prompt composer. It never clicks an
-    arbitrary last button and never treats a project/menu button as Generate.
-    """
-    def _click(loc):
+    def click_labeled(loc):
         try:
             for i in range(loc.count() - 1, -1, -1):
                 btn = loc.nth(i)
@@ -19917,93 +20027,90 @@ def _flow_click_generate_image(page, prompt_box=None, before_img_count=0):
                 btn.click(timeout=5000)
                 return True
         except Exception:
-            return False
+            pass
         return False
 
-    # 1) Exact accessible names used by Flow builds.
+    # Exact accessible names.
     for pat in (
         r"^Generate Image$", r"^Generate images?$", r"^Generate$",
         r"^Create Image$", r"^Create images?$", r"^Create$",
         r"^Run$", r"^Tạo ảnh$", r"^Tạo hình$", r"^Tạo$",
     ):
         try:
-            if _click(page.get_by_role("button", name=re.compile(pat, re.I))):
+            if click_labeled(page.get_by_role("button", name=re.compile(pat, re.I))):
                 return True
         except Exception:
             pass
 
-    # 2) Icon-only Flow controls normally expose one of these accessibility/
-    # tooltip attributes. Only click a control whose own label says generate.
+    # Icon-only / data-testid controls. The label must itself indicate creation.
+    selectors = (
+        "button[aria-label*='generate' i]",
+        "button[aria-label*='create image' i]",
+        "button[aria-label*='create images' i]",
+        "button[title*='generate' i]",
+        "button[title*='create image' i]",
+        "[role='button'][aria-label*='generate' i]",
+        "[role='button'][data-testid*='generate' i]",
+        "[role='button'][data-testid*='submit' i]",
+        "[role='button'][data-tooltip*='generate' i]",
+        "[role='button'][data-tooltip-content*='generate' i]",
+    )
+    for sel in selectors:
+        try:
+            if click_labeled(page.locator(sel)):
+                return True
+        except Exception:
+            pass
+
+    # Composer-local control. We inspect attributes/text and explicitly reject
+    # upload, project, menu, navigation and destructive controls.
     try:
-        loc = page.locator(
-            "button[aria-label*='generate' i],"
-            "button[aria-label*='create image' i],"
-            "button[title*='generate' i],"
-            "button[title*='create image' i],"
-            "[role='button'][aria-label*='generate' i],"
-            "[role='button'][data-tooltip*='generate' i],"
-            "[role='button'][data-tooltip-content*='generate' i],"
-            "[role='button'][data-testid*='generate' i]"
+        composer = box.locator(
+            "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
         )
-        if _click(loc):
-            return True
+        controls = composer.locator("button,[role='button']")
+        for i in range(controls.count() - 1, -1, -1):
+            btn = controls.nth(i)
+            try:
+                if not btn.is_visible() or not btn.is_enabled():
+                    continue
+                label = " ".join(filter(None, (
+                    btn.get_attribute("aria-label"),
+                    btn.get_attribute("title"),
+                    btn.get_attribute("data-testid"),
+                    btn.get_attribute("data-tooltip"),
+                    btn.get_attribute("data-tooltip-content"),
+                    btn.inner_text(timeout=250),
+                )))
+                if re.search(
+                    r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?",
+                    label, re.I
+                ) and not re.search(
+                    r"project|new|upload|attach|settings|menu|more|delete|cancel|close",
+                    label, re.I
+                ):
+                    btn.scroll_into_view_if_needed()
+                    btn.click(timeout=5000)
+                    return True
+            except Exception:
+                continue
     except Exception:
         pass
 
-    # 3) Inspect controls inside the same prompt composer. This is the safe
-    # fallback for Flow builds where the Generate button is icon-only and has
-    # no accessible name. We reject navigation/project/upload/menu controls.
-    box = prompt_box
-    if box is None:
-        try:
-            box = _flow_find_prompt_box(page, 5)
-        except Exception:
-            box = None
-    if box is not None:
-        try:
-            composer = box.locator(
-                "xpath=ancestor::*[.//button or .//*[@role='button']][1]"
-            )
-            controls = composer.locator("button,[role='button']")
-            for i in range(controls.count() - 1, -1, -1):
-                btn = controls.nth(i)
-                try:
-                    if not btn.is_visible() or not btn.is_enabled():
-                        continue
-                    label = " ".join(
-                        filter(None, (
-                            btn.get_attribute("aria-label"),
-                            btn.get_attribute("title"),
-                            btn.get_attribute("data-tooltip"),
-                            btn.get_attribute("data-tooltip-content"),
-                            btn.get_attribute("data-testid"),
-                            btn.inner_text(timeout=250),
-                        ))
-                    )
-                    if re.search(r"generate|create\s*(image|images)?|submit|run|tạo\s*(ảnh|hình)?", label, re.I):
-                        if not re.search(r"project|new\s+project|upload|attach|settings|menu|more|delete|cancel|close", label, re.I):
-                            btn.scroll_into_view_if_needed()
-                            btn.click(timeout=5000)
-                            return True
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-    # 4) Last resort: use the composer submit shortcut only, then require
-    # visible generation evidence. No blind Enter/click is allowed.
-    if box is not None:
-        try:
-            box.click(timeout=3000)
-            box.press("Control+Enter")
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if _flow_generation_started(page, before_img_count):
-                    return True
-                time.sleep(0.25)
-        except Exception:
-            pass
+    # Keyboard fallback is allowed only after focusing the actual composer and
+    # only when Flow visibly enters a generating state.
+    try:
+        box.click(timeout=3000)
+        box.press("Control+Enter")
+        deadline = time.monotonic() + 8
+        while time.monotonic() < deadline:
+            if _flow_generation_started(page, before_img_count):
+                return True
+            time.sleep(0.25)
+    except Exception:
+        pass
     return False
+
 
 def _flow_download_latest_asset(page,before_img_count,timeout=900):
     """Wait for the generated asset and click Flow's visible Download control."""
