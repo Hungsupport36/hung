@@ -20429,6 +20429,250 @@ def _creative_start_workers(project,count=2,worker_type="FLOW"):
     return _CREATIVE_START_WORKERS_ORIGINAL_V115(project,count=count,worker_type=worker_type)
 
 
+# ============================================================
+# V11.6.1 — FLOW PROFILE / PLAYWRIGHT RUNTIME HARDENING
+# ============================================================
+_FLOW_EXTERNAL_DRIVER_PATCHED = False
+_FLOW_EXTERNAL_DRIVER_ROOT = ""
+
+def _flow_external_playwright_driver():
+    global _FLOW_EXTERNAL_DRIVER_PATCHED, _FLOW_EXTERNAL_DRIVER_ROOT
+    if _FLOW_EXTERNAL_DRIVER_PATCHED:
+        return _FLOW_EXTERNAL_DRIVER_ROOT
+    candidates = []
+    env = str(os.getenv("VHUNG_PLAYWRIGHT_RUNTIME") or "").strip()
+    if env:
+        candidates.append(Path(env).expanduser())
+    candidates.extend([
+        BASE / "tool" / "playwright",
+        BASE / "tool" / "playwright" / "driver",
+        BASE / "tool" / "playwright" / "driver" / "package",
+    ])
+    try:
+        candidates.extend([
+            Path.home() / "Downloads" / "CloneVoice-1.1.18-win64" / "playwright",
+            Path.home() / "Downloads" / "CloneVoice-1.1.18-win64" / "CloneVoice-1.1.18-win64" / "playwright",
+        ])
+    except Exception:
+        pass
+    for raw in candidates:
+        try:
+            p = Path(raw).resolve()
+            if p.name.lower() == "package" and p.parent.name.lower() == "driver":
+                root = p.parent.parent
+            elif p.name.lower() == "driver":
+                root = p.parent
+            else:
+                root = p
+            cli = root / "driver" / "package" / "cli.js"
+            node = root / "driver" / "node.exe"
+            if not cli.is_file():
+                continue
+            if not node.is_file():
+                try:
+                    import playwright._impl._driver as _pw_driver
+                    current_node = Path(_pw_driver.compute_driver_executable()[0])
+                    if current_node.is_file():
+                        node = current_node
+                except Exception:
+                    pass
+            if not node.is_file():
+                continue
+            import playwright._impl._driver as _pw_driver
+            import playwright._impl._transport as _pw_transport
+            def _compute_external_driver(_node=str(node), _cli=str(cli)):
+                return _node, _cli
+            _pw_driver.compute_driver_executable = _compute_external_driver
+            _pw_transport.compute_driver_executable = _compute_external_driver
+            os.environ["VHUNG_PLAYWRIGHT_ACTIVE_ROOT"] = str(root)
+            os.environ["VHUNG_PLAYWRIGHT_DRIVER_CLI"] = str(cli)
+            os.environ["VHUNG_PLAYWRIGHT_DRIVER_NODE"] = str(node)
+            _FLOW_EXTERNAL_DRIVER_ROOT = str(root)
+            _FLOW_EXTERNAL_DRIVER_PATCHED = True
+            workflow_cmd_log("PLAYWRIGHT", "BUNDLED_DRIVER_SELECTED", root=str(root), cli=str(cli), node=str(node))
+            return str(root)
+        except Exception as exc:
+            workflow_cmd_log("PLAYWRIGHT", "BUNDLED_DRIVER_CANDIDATE_FAILED", path=str(raw), error=str(exc)[:500], level="DEBUG")
+    return ""
+
+def _playwright_prepare_runtime_v1161():
+    external = _flow_external_playwright_driver()
+    if external:
+        return external
+    try:
+        return _playwright_prepare_runtime()
+    except Exception:
+        return ""
+_playwright_prepare_runtime = _playwright_prepare_runtime_v1161
+
+def _playwright_chrome_runtime_check_v1161():
+    try:
+        runtime_root = _playwright_prepare_runtime()
+        from playwright.sync_api import sync_playwright
+        pw = sync_playwright().start()
+        pw.stop()
+        chrome = _flow_chrome_executable()
+        if chrome is None:
+            return False, "🔴 Không tìm thấy Google Chrome Stable."
+        source = f"BUNDLED DRIVER {runtime_root}" if runtime_root else "PYTHON PLAYWRIGHT"
+        return True, f"🟢 Playwright OK · {source} · Chrome Stable OK · {chrome}"
+    except Exception as exc:
+        return False, f"🔴 Playwright runtime lỗi: {str(exc)[:1200]}"
+_playwright_chrome_runtime_check = _playwright_chrome_runtime_check_v1161
+
+def _flow_page_has_captcha_v1161(page):
+    try:
+        url = str(page.url or "").lower()
+    except Exception:
+        url = ""
+    selectors = (
+        "iframe[src*='recaptcha' i]",
+        "iframe[src*='hcaptcha' i]",
+        "[id*='captcha' i]",
+        "[class*='captcha' i]",
+        "[data-testid*='captcha' i]",
+        "[aria-label*='captcha' i]",
+    )
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for i in range(loc.count() - 1, -1, -1):
+                if loc.nth(i).is_visible():
+                    return True
+        except Exception:
+            pass
+    challenge_re = re.compile(
+        r"(verify\s+you\s+are\s+human|unusual\s+traffic|security\s+check|"
+        r"confirm\s+you(?:'re|\s+are)\s+not\s+a\s+robot)", re.I
+    )
+    try:
+        loc = page.get_by_text(challenge_re)
+        for i in range(loc.count() - 1, -1, -1):
+            if loc.nth(i).is_visible():
+                return True
+    except Exception:
+        pass
+    if "accounts.google.com" in url and any(x in url for x in ("challenge", "signin/v2", "signinoptions")):
+        return True
+    return False
+
+_flow_page_has_captcha = _flow_page_has_captcha_v1161
+GoogleFlowAdapter._captcha_visible = staticmethod(_flow_page_has_captcha_v1161)
+
+def _flow_discover_existing_profiles_v1161():
+    _flow_account_schema()
+    roots = [FLOW_PROFILE_ROOT]
+    extra = str(os.getenv("VHUNG_FLOW_PROFILE_ROOT") or "").strip()
+    if extra:
+        roots.append(Path(extra).expanduser())
+    discovered = []
+    for root in roots:
+        try:
+            root = Path(root).expanduser().resolve()
+            if not root.is_dir():
+                continue
+            for p in sorted(root.iterdir()):
+                if not p.is_dir() or p.name.startswith("."):
+                    continue
+                with _batch_db() as db:
+                    row = db.execute(
+                        "SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' AND session_profile=? LIMIT 1",
+                        (str(p),),
+                    ).fetchone()
+                if row:
+                    continue
+                aid = p.name if re.fullmatch(r"FLOW-\d{4,}", p.name) else _flow_next_profile_id()
+                now = _creative_now()
+                with _batch_db() as db:
+                    if db.execute("SELECT account_id FROM creative_accounts WHERE account_id=?", (aid,)).fetchone():
+                        aid = _flow_next_profile_id()
+                    db.execute(
+                        "INSERT INTO creative_accounts(account_id,provider,status,session_profile,account_label,cookie_file,debug_port,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                        (aid, "GOOGLE_FLOW", "DISABLED", str(p), aid, str(_flow_storage_paths(aid)[1]), _flow_debug_port(aid), now, now),
+                    )
+                discovered.append((aid, str(p)))
+                workflow_cmd_log("FLOW_POOL", "PROFILE_AUTO_DISCOVERED", account_id=aid, profile=str(p))
+        except Exception as exc:
+            workflow_cmd_log("FLOW_POOL", "PROFILE_DISCOVERY_ERROR", root=str(root), error=str(exc)[:700], level="DEBUG")
+    return discovered
+
+def _flow_recover_stale_pool_v1161():
+    _creative_v3_migrate()
+    _flow_discover_existing_profiles_v1161()
+    now = _creative_now()
+    recovered = 0
+    with _batch_db() as db:
+        rows = db.execute("SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' AND status='BUSY'").fetchall()
+        for row in rows:
+            aid = str(row["account_id"] or "")
+            live = db.execute(
+                "SELECT 1 FROM creative_workers WHERE account_id=? AND status='RUNNING' AND job_id IS NOT NULL LIMIT 1",
+                (aid,),
+            ).fetchone()
+            if live:
+                continue
+            db.execute(
+                "UPDATE creative_accounts SET status='ACTIVE',last_error=NULL,cooldown_until=NULL,updated_at=? WHERE account_id=? AND status='BUSY'",
+                (now, aid),
+            )
+            recovered += 1
+    if recovered:
+        workflow_cmd_log("FLOW_POOL", "STALE_BUSY_RECOVERED", count=recovered)
+    return recovered
+
+def _creative_claim_account_checked_v1161(worker_id, job_id, provider=CREATIVE_ENGINE_FLOW):
+    _flow_recover_stale_pool_v1161()
+    _creative_refresh_cooldowns()
+    account_id = _creative_atomic_claim_account(worker_id, job_id, provider)
+    if account_id:
+        ok, detail = _creative_session_health(account_id, worker_id, force=True)
+        if ok:
+            return account_id, "OK"
+        detail = str(detail or "")
+        now = _creative_now()
+        with _batch_db() as db:
+            db.execute(
+                "UPDATE creative_accounts SET status='AUTH_ERROR',last_error=?,updated_at=? WHERE account_id=?",
+                (detail[:1500], now, account_id),
+            )
+            db.execute(
+                "UPDATE creative_jobs SET status='RETRY',error_class='AUTH_ERROR',error=?,worker_id=NULL,account_id=NULL,ready_at=?,updated_at=? WHERE job_id=? AND status='RUNNING'",
+                (detail[:1500], now, now, job_id),
+            )
+            db.execute(
+                "UPDATE creative_workers SET status='IDLE',job_id=NULL,account_id=NULL,updated_at=? WHERE worker_id=?",
+                (now, worker_id),
+            )
+        return None, detail
+    with _batch_db() as db:
+        candidates = db.execute(
+            "SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' AND status='CAPTCHA' AND session_profile IS NOT NULL AND session_profile<>'' ORDER BY updated_at ASC LIMIT 10"
+        ).fetchall()
+    for row in candidates:
+        aid = str(row["account_id"] or "")
+        ok, detail = _creative_session_health(aid, worker_id, force=True)
+        if ok:
+            _creative_set_account_state(aid, "ACTIVE", None, None)
+            account_id = _creative_atomic_claim_account(worker_id, job_id, provider)
+            if account_id:
+                return account_id, "OK"
+        else:
+            workflow_cmd_log("FLOW_POOL", "PROFILE_HEALTH_STILL_BAD", account_id=aid, detail=str(detail)[:800], level="DEBUG")
+    return None, "NO_ACTIVE_ACCOUNT"
+
+_creative_claim_account_checked_v7 = _creative_claim_account_checked_v1161
+_creative_claim_account_checked = _creative_claim_account_checked_v1161
+
+_FLOW_ORIGINAL_LAUNCH_UI = launch_ui
+def launch_ui_v1161():
+    try:
+        _flow_recover_stale_pool_v1161()
+    except Exception as exc:
+        workflow_cmd_log("FLOW_POOL", "STARTUP_RECONCILE_ERROR", error=str(exc)[:700], level="DEBUG")
+    return _FLOW_ORIGINAL_LAUNCH_UI()
+launch_ui = launch_ui_v1161
+
+
 if __name__ == '__main__':
     import argparse
     if os.name == 'nt':
