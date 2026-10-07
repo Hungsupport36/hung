@@ -14568,15 +14568,61 @@ def _flow_account_schema():
             db.execute("ALTER TABLE creative_accounts ADD COLUMN debug_port INTEGER")
 
 def _flow_next_profile_id():
+    """Return the lowest reusable FLOW id and reconcile deleted local profiles.
+
+    If the user deletes FLOW-0001's profile folder from LocalAIStudio_Data,
+    that old DB row must not permanently reserve the number. We remove stale
+    rows whose registered profile path no longer exists, then choose the
+    smallest free FLOW-NNNN instead of max(existing)+1.
+    """
     _flow_account_schema()
+    global _CREATIVE_FLOW_ADAPTER
     with _batch_db() as db:
-        rows = db.execute("SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' AND account_id LIKE 'FLOW-%'").fetchall()
-    nums = []
-    for row in rows:
-        m = re.fullmatch(r"FLOW-(\d+)", str(row[0] or ""))
-        if m:
-            nums.append(int(m.group(1)))
-    return f"FLOW-{(max(nums) + 1) if nums else 1:04d}"
+        rows = db.execute(
+            "SELECT account_id,session_profile,status FROM creative_accounts "
+            "WHERE provider='GOOGLE_FLOW' AND account_id LIKE 'FLOW-%'"
+        ).fetchall()
+
+        stale = []
+        used = set()
+        for row in rows:
+            aid = str(row["account_id"] or "")
+            m = re.fullmatch(r"FLOW-(\d+)", aid)
+            if not m:
+                continue
+            n = int(m.group(1))
+            profile = str(row["session_profile"] or "").strip()
+
+            # A manually/custom supplied profile is considered deleted when
+            # its registered directory is gone. Do not remove a live session
+            # that is still held by the in-memory adapter.
+            live = False
+            try:
+                if _CREATIVE_FLOW_ADAPTER is not None:
+                    item = _CREATIVE_FLOW_ADAPTER._contexts.get(aid)
+                    if item:
+                        _pw, browser, page = item
+                        live = bool(browser.is_connected()) and not page.is_closed()
+            except Exception:
+                live = False
+
+            if profile and not Path(profile).expanduser().exists() and not live:
+                stale.append(aid)
+            else:
+                used.add(n)
+
+        if stale:
+            placeholders = ",".join("?" for _ in stale)
+            db.execute(
+                f"DELETE FROM creative_accounts WHERE provider='GOOGLE_FLOW' "
+                f"AND account_id IN ({placeholders})",
+                stale,
+            )
+
+        n = 1
+        while n in used:
+            n += 1
+        return f"FLOW-{n:04d}"
 
 def _flow_storage_paths(account_id):
     safe = safe_name(account_id)
