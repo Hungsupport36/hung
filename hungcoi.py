@@ -15348,9 +15348,13 @@ async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
             pass
     return _result
 
+async def _creative_flow_manual_profile_verify_core(account_id):
+    """Stable UI-facing implementation; owns the real async Playwright verifier."""
+    return await _creative_flow_manual_profile_verify_async_impl(account_id)
+
 async def _creative_flow_manual_profile_verify_impl(account_id):
-    """Stable UI-facing implementation; delegates to the real async verifier."""
-    return await _creative_flow_manual_profile_verify_async(account_id)
+    """Compatibility entrypoint. Never self-calls; delegates to the unique core."""
+    return await _creative_flow_manual_profile_verify_core(account_id)
 
 async def _creative_flow_manual_profile_verify(*args, **kwargs):
     _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs)
