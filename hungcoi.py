@@ -15256,6 +15256,16 @@ def _playwright_runtime_candidates():
         BASE / "runtime" / "playwright",
         BASE / "tool" / "runtime" / "playwright",
     ])
+    # Legacy CloneVoice portable runtime commonly lives under the Windows
+    # user's Downloads folder; detect it without hard-coding a username.
+    try:
+        home = Path.home()
+        candidates.extend([
+            home / "Downloads" / "CloneVoice-1.1.18-win64" / "playwright",
+            home / "Downloads" / "CloneVoice-1.1.18-win64" / "CloneVoice-1.1.18-win64" / "playwright",
+        ])
+    except Exception:
+        pass
     for root in (BASE, *list(BASE.parents)[:4]):
         candidates.extend([
             root / "CloneVoice-1.1.18-win64" / "playwright",
