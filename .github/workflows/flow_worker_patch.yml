@@ -1,4 +1,4 @@
-name: V11.5.3 Flow worker patch
+name: V11.5.4 Flow Playwright runtime patch
 
 on:
   push:
@@ -18,99 +18,93 @@ jobs:
           ref: fix/creative-studio-v7
           fetch-depth: 1
 
-      - name: Patch Flow Generate control
+      - name: Patch Flow Playwright runtime
         shell: python
         run: |
           from pathlib import Path
-          import re
 
           p = Path("hungcoi.py")
           s = p.read_text(encoding="utf-8")
-          start = s.index("def _flow_click_generate_image(page):")
-          end = s.index("\ndef _flow_download_latest_asset(", start)
 
-          new = r'''def _flow_click_generate_image(page):
-    """Submit the real Flow composer without depending on one aria-label."""
-    generate_re = re.compile(
-        r"generate|create\s*(image|images|video|videos)?|submit|run|tạo\s*(ảnh|hình)?",
-        re.I,
-    )
-    bad_re = re.compile(
-        r"cancel|close|attach|upload|add|settings|menu|more|delete|download|share|help",
-        re.I,
-    )
+          helper = r'''
+def _vhung_playwright_driver():
+    """Return the Playwright Node driver used by the proven Windows runtime.
 
-    def _label(node):
-        vals = []
-        for name in (
-            "aria-label", "title", "data-testid", "data-test-id",
-            "data-tooltip", "data-tooltip-content", "name",
-        ):
-            try:
-                v = node.get_attribute(name)
-                if v:
-                    vals.append(str(v))
-            except Exception:
-                pass
-        try:
-            vals.append(node.inner_text(timeout=250) or "")
-        except Exception:
-            pass
-        return " ".join(vals).strip()
+    Priority:
+      1. VHUNG_PLAYWRIGHT_DRIVER_ROOT\node.exe + package\cli.js
+      2. tool/playwright/driver
+      3. bundled playwright/driver
+      4. the user's existing CloneVoice 1.1.18 runtime
+    """
+    candidates = []
+    env_root = str(os.getenv("VHUNG_PLAYWRIGHT_DRIVER_ROOT") or "").strip()
+    if env_root:
+        candidates.append(Path(env_root).expanduser())
+    candidates.extend([
+        BASE / "tool" / "playwright" / "driver",
+        BASE / "playwright" / "driver",
+        Path(r"C:\Users\hungcoi\Downloads\CloneVoice-1.1.18-win64\CloneVoice-1.1.18-win64\playwright\driver"),
+    ])
+    for root in candidates:
+        root = root.resolve()
+        node = root / "node.exe"
+        cli = root / "package" / "cli.js"
+        if node.is_file() and cli.is_file():
+            return str(node), str(cli), root
+    return None, None, None
 
-    # 1) Resolve the visible Generate/Create control by accessible metadata.
-    for selector in (
-        "button", "[role='button']", "[aria-label]", "[title]",
-        "[data-testid]", "[data-tooltip]",
-    ):
-        try:
-            loc = page.locator(selector)
-            for i in range(loc.count() - 1, -1, -1):
-                b = loc.nth(i)
-                if not b.is_visible() or not b.is_enabled():
-                    continue
-                label = _label(b)
-                if generate_re.search(label) and not bad_re.search(label):
-                    b.scroll_into_view_if_needed()
-                    b.click(timeout=5000)
-                    return True
-        except Exception:
-            continue
 
-    # 2) Old Creative Studio fallback: submit from the focused Flow composer.
-    #    One Ctrl+Enter attempt, then one Enter attempt; never spam keys.
-    try:
-        boxes = page.locator(
-            "textarea, [contenteditable='true'], [role='textbox'], input[type='text']"
+def _apply_vhung_playwright_driver():
+    node, cli, root = _vhung_playwright_driver()
+    if not node or not cli:
+        workflow_cmd_log(
+            "FLOW",
+            "PLAYWRIGHT_RUNTIME_FALLBACK",
+            detail="Không tìm thấy runtime Playwright ngoài; dùng driver của Python package hiện tại.",
+            level="DEBUG",
         )
-        box = None
-        for i in range(boxes.count() - 1, -1, -1):
-            x = boxes.nth(i)
-            if x.is_visible() and x.is_enabled():
-                box = x
-                break
-        if box is not None:
-            box.click(timeout=3000)
-            try:
-                box.press("Control+Enter")
-                time.sleep(1.0)
-                return True
-            except Exception:
-                pass
-            try:
-                box.press("Enter")
-                time.sleep(1.0)
-                return True
-            except Exception:
-                pass
+        return False
+
+    def _compute():
+        return node, cli
+
+    try:
+        import playwright._impl._driver as _pw_driver
+        _pw_driver.compute_driver_executable = _compute
+    except Exception:
+        pass
+    try:
+        import playwright._impl._transport as _pw_transport
+        _pw_transport.compute_driver_executable = _compute
     except Exception:
         pass
 
-    return False
+    os.environ["PLAYWRIGHT_NODEJS_PATH"] = node
+    workflow_cmd_log(
+        "FLOW",
+        "PLAYWRIGHT_RUNTIME_SELECTED",
+        driver=str(root),
+        node=node,
+        cli=cli,
+    )
+    return True
+
 '''
 
-          s = s[:start] + new + s[end:]
-          p.write_text(s, encoding="utf-8")
+        marker = "def _flow_thread_context(self, account_id):"
+        if marker not in s:
+            raise SystemExit("Không tìm thấy _flow_thread_context trong hungcoi.py")
+
+        if "def _apply_vhung_playwright_driver():" not in s:
+            s = s.replace(marker, helper + marker, 1)
+
+        old = "    from playwright.sync_api import sync_playwright\n"
+        new = "    _apply_vhung_playwright_driver()\n    from playwright.sync_api import sync_playwright\n"
+        if old not in s:
+            raise SystemExit("Không tìm thấy import sync_playwright trong _flow_thread_context")
+        s = s.replace(old, new, 1)
+
+        p.write_text(s, encoding="utf-8")
 
       - name: Commit patch
         shell: bash
@@ -122,5 +116,5 @@ jobs:
             echo "No changes"
             exit 0
           fi
-          git commit -m "V11.5.3: use real Flow composer submission fallback"
+          git commit -m "V11.5.4: use proven CloneVoice Playwright driver"
           git push origin HEAD:fix/creative-studio-v7
