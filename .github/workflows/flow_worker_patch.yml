@@ -1,0 +1,186 @@
+name: V11.6.5 Repair Creative Studio verify recursion
+
+on:
+  push:
+    branches: [fix/creative-studio-v7]
+    paths:
+      - ".github/workflows/flow_worker_patch.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/creative-studio-v7
+          fetch-depth: 1
+
+      - name: Repair recursive Flow profile verify wrappers
+        shell: python
+        run: |
+          from pathlib import Path
+          import ast
+          import textwrap
+
+          p = Path("hungcoi.py")
+          s = p.read_text(encoding="utf-8")
+          tree = ast.parse(s, filename="hungcoi.py")
+          lines = s.splitlines(keepends=True)
+
+          def nodes_named(name):
+              return sorted(
+                  [
+                      n for n in ast.walk(tree)
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                      and n.name == name
+                  ],
+                  key=lambda n: n.lineno,
+              )
+
+          impls = nodes_named("_creative_flow_manual_profile_verify_async_impl")
+          pools = nodes_named("_creative_account_pool_html")
+          if not impls or not pools:
+              raise SystemExit("Required Flow verify/account-pool AST nodes not found")
+
+          # Keep the earliest real implementation and discard all duplicate
+          # wrappers/impl definitions until the account-pool section.
+          impl_node = impls[0]
+          pool_node = next((n for n in pools if n.lineno > impl_node.lineno), None)
+          if pool_node is None:
+              raise SystemExit("No account-pool function after Flow verify implementation")
+
+          start = impl_node.lineno - 1
+          end = pool_node.lineno - 1
+          impl_source = "".join(lines[start:impl_node.end_lineno])
+
+          clean = textwrap.dedent(r'''
+          async def _creative_flow_manual_profile_verify_async(*args, **kwargs):
+              _result = await _creative_flow_manual_profile_verify_async_impl(*args, **kwargs)
+              try:
+                  import inspect as _inspect
+                  _sig = _inspect.signature(_creative_flow_manual_profile_verify_async_impl)
+                  _bound = _sig.bind_partial(*args, **kwargs)
+                  _account_id = (
+                      _bound.arguments.get("account_id")
+                      or _bound.arguments.get("account")
+                      or _bound.arguments.get("account_name")
+                  )
+                  _profile = (
+                      _bound.arguments.get("profile")
+                      or _bound.arguments.get("profile_path")
+                      or _bound.arguments.get("session_profile")
+                  )
+                  _worker = _bound.arguments.get("worker_id")
+                  _ok = bool(_result)
+                  if isinstance(_result, dict):
+                      _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
+                      _account_id = _account_id or _result.get("account_id")
+                      _profile = _profile or _result.get("profile_path")
+                      _worker = _worker or _result.get("worker_id")
+                  elif isinstance(_result, (tuple, list)):
+                      _ok = bool(_result[0]) if _result else False
+                  if _ok:
+                      _creative_activate_verified_flow_account(
+                          account_id=_account_id,
+                          profile_path=_profile,
+                          worker_id=_worker,
+                      )
+              except Exception as _exc:
+                  try:
+                      workflow_cmd_log(
+                          "FLOW",
+                          "PROFILE_VERIFY_WRAPPER_ERROR",
+                          error=str(_exc)[:500],
+                      )
+                  except Exception:
+                      pass
+              return _result
+
+          async def _creative_flow_manual_profile_verify_impl(account_id):
+              """Stable UI-facing implementation; delegates to the real async verifier."""
+              return await _creative_flow_manual_profile_verify_async(account_id)
+
+          async def _creative_flow_manual_profile_verify(*args, **kwargs):
+              _result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs)
+              try:
+                  import inspect as _inspect
+                  _sig = _inspect.signature(_creative_flow_manual_profile_verify_impl)
+                  _bound = _sig.bind_partial(*args, **kwargs)
+                  _account_id = (
+                      _bound.arguments.get("account_id")
+                      or _bound.arguments.get("account")
+                      or _bound.arguments.get("account_name")
+                  )
+                  _profile = (
+                      _bound.arguments.get("profile")
+                      or _bound.arguments.get("profile_path")
+                      or _bound.arguments.get("session_profile")
+                  )
+                  _worker = _bound.arguments.get("worker_id")
+                  _ok = bool(_result)
+                  if isinstance(_result, dict):
+                      _ok = bool(_result.get("ok") or _result.get("verified") or _result.get("success"))
+                      _account_id = _account_id or _result.get("account_id")
+                      _profile = _profile or _result.get("profile_path")
+                      _worker = _worker or _result.get("worker_id")
+                  elif isinstance(_result, (tuple, list)):
+                      _ok = bool(_result[0]) if _result else False
+                  if _ok:
+                      _creative_activate_verified_flow_account(
+                          account_id=_account_id,
+                          profile_path=_profile,
+                          worker_id=_worker,
+                      )
+              except Exception as _exc:
+                  try:
+                      workflow_cmd_log(
+                          "FLOW",
+                          "PROFILE_VERIFY_WRAPPER_ERROR",
+                          error=str(_exc)[:500],
+                      )
+                  except Exception:
+                      pass
+              return _result
+
+          ''').lstrip()
+
+          new_s = "".join(lines[:start]) + impl_source.rstrip() + "\n\n" + clean + "".join(lines[end:])
+
+          final_tree = ast.parse(new_s, filename="hungcoi.py")
+          for name in (
+              "_creative_flow_manual_profile_verify_async_impl",
+              "_creative_flow_manual_profile_verify_async",
+              "_creative_flow_manual_profile_verify_impl",
+              "_creative_flow_manual_profile_verify",
+          ):
+              count = sum(
+                  1 for n in ast.walk(final_tree)
+                  if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+                  and n.name == name
+              )
+              if count != 1:
+                  raise SystemExit(f"{name}: expected 1 definition, got {count}")
+
+          if "return await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else" in new_s:
+              raise SystemExit("Recursive conditional wrapper still present")
+          if "_result = await _creative_flow_manual_profile_verify_impl(*args, **kwargs) if True else" in new_s:
+              raise SystemExit("Recursive wrapper expression still present")
+
+          p.write_text(new_s, encoding="utf-8")
+          print("V11.6.5: Flow profile verify recursion repaired; AST OK")
+
+      - name: Commit repair
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add hungcoi.py
+          if git diff --cached --quiet; then
+            echo "No changes"
+            exit 0
+          fi
+          git commit -m "V11.6.5: repair Flow profile verify recursion"
+          git push origin HEAD:fix/creative-studio-v7
