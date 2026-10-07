@@ -15158,71 +15158,51 @@ def _playwright_runtime_ui():
 
 _V9_FLOW_CONTEXT = GoogleFlowAdapter._context
 def _flow_context_registered_profile(self, account_id):
-    row = _creative_get_account(account_id)
-    profile = str((row or {}).get("session_profile") or "").strip()
-    if not profile:
-        return _V9_FLOW_CONTEXT(self, account_id)
+    """Attach to the same Stable Chrome profile from the current worker thread.
+    Sync Playwright objects are never reused across Gradio/worker threads.
+    """
+    row=_creative_get_account(account_id)
+    profile=str((row or {}).get("session_profile") or "").strip()
+    if not profile: raise RuntimeError(f"{account_id} chưa có session_profile.")
+    ok,detail=_playwright_chrome_runtime_check()
+    if not ok: raise RuntimeError(detail)
+    port=int((row or {}).get("debug_port") or _flow_debug_port(account_id))
+    if not _flow_cdp_ready(port,timeout=3):
+        p=Path(profile).expanduser().resolve(); p.mkdir(parents=True,exist_ok=True)
+        _flow_launch_stable_chrome(account_id,str(p),self.FLOW_URL)
+        if not _flow_cdp_ready(port,timeout=10):
+            raise RuntimeError(f"Chrome đã mở lại nhưng CDP chưa sẵn sàng cho {account_id}.")
     try:
-        item = self._contexts.get(account_id)
-        if item:
-            pw, browser, page = item
-            if browser.is_connected() and not page.is_closed():
-                return item
-    except Exception:
+        asyncio.get_running_loop()
+    except RuntimeError:
         pass
-    ok, detail = _playwright_chrome_runtime_check()
-    if not ok:
-        raise RuntimeError(detail)
+    else:
+        raise RuntimeError("Flow Playwright Sync API không được phép chạy trực tiếp trong asyncio thread.")
     from playwright.sync_api import sync_playwright
-    port = int((row or {}).get("debug_port") or _flow_debug_port(account_id))
-    if not _flow_cdp_ready(port, timeout=3):
-        # Chrome may have been closed by the user. Re-open the SAME tool-owned
-        # profile with real installed Chrome Stable, then attach over CDP.
-        # Do not use launch_persistent_context(channel="chrome") here: that
-        # creates a second Playwright-managed browser lifecycle and can leave
-        # the profile locked after the user closes Chrome.
-        p = Path(profile).expanduser().resolve()
-        p.mkdir(parents=True, exist_ok=True)
-        try:
-            _flow_launch_stable_chrome(account_id, str(p), self.FLOW_URL)
-        except Exception as exc:
-            raise RuntimeError(f"Không thể mở lại Chrome Stable cho {account_id}: {exc}")
-        if not _flow_cdp_ready(port, timeout=10):
-            raise RuntimeError(f"Chrome đã được gọi mở lại nhưng CDP chưa sẵn sàng cho {account_id}.")
-    # Connect to the already-running stable Chrome instance in THIS thread.
-    # Do not reuse Playwright objects created by another thread.
-    pw = sync_playwright().start()
-    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=10000)
-    contexts = browser.contexts
-    if not contexts:
-        raise RuntimeError(f"Chrome CDP connected nhưng không có BrowserContext: {account_id}")
-    context = contexts[0]
-    page = context.pages[0] if context.pages else context.new_page()
-    if not page.url or "flow" not in page.url.lower():
-        try:
-            page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
-        except Exception:
-            pass
-    # Register the attached context so VERIFY/health_check can see the
-    # exact browser session that was just connected. The previous V11 code
-    # returned the tuple but forgot to put it into _contexts, so health_check()
-    # always reported "Session chưa mở." immediately after manual login.
-    self._contexts[account_id] = (pw, browser, page)
-    return self._contexts[account_id]
-
+    pw=sync_playwright().start()
+    try:
+        browser=pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}",timeout=10000)
+        contexts=browser.contexts
+        if not contexts: raise RuntimeError(f"Chrome CDP không có BrowserContext: {account_id}")
+        context=contexts[0]
+        page=context.pages[0] if context.pages else context.new_page()
+        if not page.url or "flow" not in page.url.lower():
+            try: page.goto(self.FLOW_URL,wait_until="domcontentloaded",timeout=60000)
+            except Exception: pass
+        return pw,browser,page
+    except Exception:
+        try: pw.stop()
+        except Exception: pass
+        raise
 GoogleFlowAdapter._context = _flow_context_registered_profile
 
 def launch_ui():
     _cleanup_gradio_temp(force=True)
     workflow_cmd_log('SUPERVISOR', 'STARTUP_HEALTH', project='', health=background_health_snapshot())
     hud_ok = start_workflow_status_server()
-    # Self-check/download the shared Z-Image model once at app startup. The daemon
-    # thread prevents a 30–50+ GB first install from freezing Gradio's UI creation.
-    threading.Thread(
-        target=_zimage_startup_preflight,
-        name="VHUNG-ZImage-StartupPreflight",
-        daemon=True,
-    ).start()
+    # Selected engine is authoritative. Do not bootstrap/download Z Image when Google Flow is selected.
+    if _selected_image_engine() == CREATIVE_ENGINE_ZIMAGE:
+        threading.Thread(target=_zimage_startup_preflight,name="VHUNG-ZImage-StartupPreflight",daemon=True).start()
     """Full UI: Voice, Images, Model, Environment, Script and production workflow.
 
     Project storage is session-gated: opening the app never activates the last
@@ -18614,7 +18594,7 @@ def launch_ui():
                 gem_output = gr.Dataframe(headers=['Image Scene','Kịch bản','Prompt đã tạo'], value=prompt_scene_rows(load_manifest(default_project)), interactive=False, wrap=True, label='🖼 Scene + Prompt')
                 with gr.Row():
                     image_only_btn = gr.Button('🖼 IMAGE ONLY · Chỉ tạo ảnh', variant='primary', visible=True, elem_id='image-only-btn')
-                    start_image_btn = gr.Button('⚡ Tạo ảnh bằng Z-Image-Turbo', variant='secondary', visible=True, elem_id='manual-flow-trigger')
+                    start_image_btn = gr.Button('🌐 Tạo ảnh bằng Google Flow' if _selected_image_engine() == CREATIVE_ENGINE_FLOW else '⚡ Tạo ảnh bằng Z Image', variant='secondary', visible=True, elem_id='manual-flow-trigger')
                 with gr.Row():
                     zimage_progress = gr.Slider(0,100,0,step=1,label='🖌 Tiến trình vẽ ảnh',interactive=False, elem_id='las-zimage-progress', elem_classes=['las-progress-compact'], scale=4)
                 zimage_status = gr.Markdown('🟦 Chưa bắt đầu.')
@@ -18622,9 +18602,28 @@ def launch_ui():
 
                 # ComfyUI is API-only for the production workflow.  No browser tab is opened.
                 image_refresh_all.click(_wrap_gradio_callback(_refresh_image_data_master_ui), project, [gem_scene_count, gem_output, image_style_context, start_image_btn, image_refresh_status], show_progress='minimal')
-                def _zimage_manual_ui(project_name):
-                    for pct, status, hud in run_zimage_txt2img_queue(project_name):
-                        yield pct, status, hud
+                def _selected_engine_manual_ui(project_name):
+                    engine=_selected_image_engine()
+                    ok,detail=_creative_environment_check(engine)
+                    if not ok:
+                        yield 0,detail,_workflow_progress_card(detail,0,"image"); return
+                    scenes=load_manifest(project_name)
+                    if not scenes:
+                        yield 0,"⛔ Chưa có Scene.",_workflow_progress_card("⛔ Chưa có Scene.",0,"image"); return
+                    _creative_master_full(_batch_project_name(project_name),scenes,engine,start=True)
+                    total=sum(1 for s in scenes if scene_media_type(s,"image")=="image")
+                    active_total=total*len(CREATIVE_IMAGE_ONLY_STAGES)
+                    while True:
+                        with _batch_db() as db:
+                            rows=db.execute("SELECT scene_id,stage,status FROM creative_jobs WHERE project_id=?",(project_name,)).fetchall()
+                        done=sum(1 for r in rows if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"]=="DONE")
+                        failed=sum(1 for r in rows if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"]=="FAILED")
+                        captcha=sum(1 for r in rows if r["stage"] in CREATIVE_IMAGE_ONLY_STAGES and r["status"]=="CAPTCHA")
+                        pct=int(min(99,(done/active_total)*100)) if active_total else 100
+                        status=f"{engine}: DONE {done}/{active_total} · CAPTCHA {captcha} · FAIL {failed}"
+                        yield pct,status,_workflow_progress_card(status,pct,"image")
+                        if failed or (active_total and done>=active_total): return
+                        time.sleep(1.0)
 
                 image_only_btn.click(
                     _wrap_gradio_callback(clear_full_stop), outputs=[], show_progress='minimal'
@@ -18638,7 +18637,7 @@ def launch_ui():
                     lambda *args: (0, '⚡ Z-Image-Turbo: nạp model + chuẩn bị batch…'),
                     outputs=[zimage_progress, zimage_status]
                 ).then(
-                    _wrap_gradio_callback(_zimage_manual_ui), [project], [zimage_progress, zimage_status, workflow_return_status], show_progress='full'
+                    _wrap_gradio_callback(_selected_engine_manual_ui), [project], [zimage_progress, zimage_status, workflow_return_status], show_progress='full'
                 )
 
                 project.change(lambda p: f'**{len(load_manifest(p))} scenes**' if load_manifest(p) else '**0 scenes** — trắng.', project, gem_scene_count)
