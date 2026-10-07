@@ -7580,6 +7580,9 @@ def _flow_create_project(page, timeout=60):
     deadline = time.monotonic() + timeout
     url_now = str(page.url or "")
     workflow_cmd_log("FLOW", "PROJECT_STAGE_START", url=url_now[:500], timeout=timeout)
+    # Current Flow UI (as seen in the verified Chrome profile) labels the
+    # homepage project card exactly "Dự án mới". Keep this as a first-class
+    # control, not a generic button guess.
 
     def _ready():
         try:
@@ -7594,6 +7597,8 @@ def _flow_create_project(page, timeout=60):
     create_patterns = (
         r"^\\+\\s*New project$",
         r"^New project$",
+        r"^\\+\\s*Dự án mới$",
+        r"^Dự án mới$",
         r"^Create new project$",
         r"^Create project$",
         r"^New$",
@@ -7623,6 +7628,8 @@ def _flow_create_project(page, timeout=60):
         text_patterns = (
             r"\\+\\s*New project",
             r"New project",
+            r"\\+\\s*Dự án mới",
+            r"Dự án mới",
             r"Tạo dự án",
             r"Tạo mới",
         )
