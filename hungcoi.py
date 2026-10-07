@@ -14835,12 +14835,25 @@ async def _creative_flow_manual_profile_verify_async(account_id):
                     f"🔴 {aid} chưa ACTIVE · CAPTCHA đang yêu cầu xử lý."
                 )
 
-            auth_markers = (
-                "sign in", "log in", "đăng nhập", "sign-in", "accounts.google.com"
+            # Do not classify a Flow page as AUTH_ERROR just because the UI
+            # contains generic words such as "Sign in". Flow can render account
+            # menus/dialogs containing those words while the actual session is
+            # authenticated. Only treat it as logged out when we are clearly on
+            # Google's login endpoint or a page whose visible content is a
+            # dedicated sign-in screen and is NOT the Flow app.
+            current_url = str(page.url or "").lower()
+            on_google_login = (
+                "accounts.google.com" in current_url
+                and ("signin" in current_url or "login" in current_url)
             )
-            # A Google account page is not itself proof of logout. Only mark
-            # AUTH_ERROR when the visible page clearly exposes a sign-in state.
-            if any(x in body for x in auth_markers) and "flow" not in body:
+            dedicated_login = (
+                any(x in body for x in (
+                    "sign in to continue", "choose an account", "use another account"
+                ))
+                and "labs.google" not in current_url
+                and "flow" not in current_url
+            )
+            if on_google_login or dedicated_login:
                 detail = "Flow session chưa đăng nhập Google/Flow."
                 _creative_set_account_state(aid, "AUTH_ERROR", detail)
                 return _creative_account_pool_html(), f"🔴 {aid} chưa ACTIVE · {detail}"
@@ -14849,7 +14862,7 @@ async def _creative_flow_manual_profile_verify_async(account_id):
             try:
                 text_body = await page.locator("body").inner_text(timeout=3000) or ""
                 emails = re.findall(
-                    r"\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b",
+                    r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b",
                     text_body,
                     flags=re.I,
                 )
@@ -14870,6 +14883,12 @@ async def _creative_flow_manual_profile_verify_async(account_id):
 
             now = _creative_now()
             label = identity or str((row or {}).get("account_label") or aid)
+            # Persist the browser-backed session as the source of truth. The
+            # Chrome user-data-dir remains the durable login store; the
+            # storage_state file is an additional recovery snapshot.
+            profile_path = str(Path(profile).expanduser().resolve())
+            if not Path(profile_path).exists():
+                raise RuntimeError(f"Profile folder không tồn tại sau VERIFY: {profile_path}")
             with _batch_db() as db:
                 db.execute(
                     "UPDATE creative_accounts SET status='ACTIVE',account_label=?,"
