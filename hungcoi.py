@@ -948,17 +948,13 @@ def _creative_engine_available(engine):
 
 
 def _creative_choose_engine_for_worker(requested_engine):
-    """Worker-side decision. Scheduler never writes actual_engine."""
-    requested = str(requested_engine or CREATIVE_ENGINE_AUTO).upper()
-    if requested == CREATIVE_ENGINE_ZIMAGE:
+    """Strict user-selected image engine. Never silently fallback."""
+    selected = _selected_image_engine()
+    if selected == "Z_IMAGE":
         return CREATIVE_ENGINE_ZIMAGE, None
-    if requested == CREATIVE_ENGINE_FLOW:
-        return (CREATIVE_ENGINE_FLOW, None) if _creative_engine_available(CREATIVE_ENGINE_FLOW) else (None, "Google Flow không có Account ACTIVE.")
     if _creative_engine_available(CREATIVE_ENGINE_FLOW):
         return CREATIVE_ENGINE_FLOW, None
-    if _creative_engine_available(CREATIVE_ENGINE_ZIMAGE):
-        return CREATIVE_ENGINE_ZIMAGE, "Google Flow không sẵn sàng; chuyển sang Z Image."
-    return None, "Không có Engine khả dụng."
+    return None, "Google Flow đã được chọn nhưng chưa CONNECTED. Không tự chuyển sang Z Image."
 
 
 def _creative_set_actual_engine(job_id, engine, reason=None):
@@ -2255,6 +2251,12 @@ def _batch_job_id(project, scene_id, stage):
 
 def _batch_sync_jobs(project, reset=False):
     project = _batch_project_name(project)
+    env_ok, env_detail = _creative_environment_check()
+    if not env_ok:
+        workflow_cmd_log("MASTER", "ENVIRONMENT_BLOCKED", project=project, engine=_selected_image_engine(), detail=env_detail, level="ERROR")
+        yield _workflow_progress_card(f"⛔ {env_detail} — Master chưa được phép chạy.", 0, "master")
+        return
+    workflow_cmd_log("MASTER", "ENVIRONMENT_CONNECTED", project=project, engine=_selected_image_engine(), detail=env_detail)
     scenes = load_manifest(project)
     now = _batch_now()
     if not project or not scenes:
@@ -10005,7 +10007,7 @@ def _master_zimage_after_prompt_ui(project, handoff_status):
     if not scenes:
         yield _workflow_progress_card("⛔ Không có Scene để tạo Job.",100,"zimage"); return
     _creative_master_full(project,scenes,CREATIVE_ENGINE_AUTO,start=True)
-    workflow_cmd_log("MASTER","CREATIVE_JOBS_CREATED",project=project,scene_count=len(scenes),requested_engine="AUTO")
+    workflow_cmd_log("MASTER","CREATIVE_JOBS_CREATED",project=project,scene_count=len(scenes),requested_engine=_selected_image_engine())
     yield _workflow_progress_card(f"🧠 Đã tạo Job Engine cho {len(scenes)} Scene · Flow Primary / Z Image Fallback.",10,"zimage")
     deadline=time.monotonic()+max(300,int(os.getenv("VHUNG_MASTER_IMAGE_TIMEOUT","86400")))
     while time.monotonic()<deadline:
@@ -13499,6 +13501,65 @@ CREATIVE_IMAGE_WIDTH = 1024
 CREATIVE_IMAGE_HEIGHT = 576
 CREATIVE_FLOW_RESULT_TIMEOUT = int(os.getenv("VHUNG_FLOW_RESULT_TIMEOUT", "900") or 900)
 CREATIVE_FLOW_POLL_SECONDS = 1.0
+CREATIVE_IMAGE_ENGINE_CHOICES = [
+    ("🌐 Google Flow — PRIMARY", "GOOGLE_FLOW"),
+    ("⚡ Z Image — LOCAL", "Z_IMAGE"),
+]
+
+def _selected_image_engine():
+    value = str(SETTINGS.get("selected_image_engine") or "GOOGLE_FLOW").upper().strip()
+    return value if value in {"GOOGLE_FLOW", "Z_IMAGE"} else "GOOGLE_FLOW"
+
+def _creative_environment_check(engine=None):
+    """Strict gate: selected engine must actually be usable before Master."""
+    engine = str(engine or _selected_image_engine()).upper().strip()
+    if engine == "Z_IMAGE":
+        try:
+            if not callable(globals().get("run_zimage_txt2img_queue")):
+                return False, "🔴 Z Image chưa sẵn sàng: chưa có Z Image queue."
+            ok = bool(_zimage_startup_preflight()) if callable(globals().get("_zimage_startup_preflight")) else True
+            return (True, "🟢 Z Image LOCAL CONNECTED") if ok else (False, "🔴 Z Image/ComfyUI chưa CONNECTED.")
+        except Exception as exc:
+            return False, f"🔴 Z Image CONNECT ERROR: {str(exc)[:500]}"
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception:
+        return False, "🔴 Google Flow chưa sẵn sàng: thiếu Playwright."
+    try:
+        _creative_v3_migrate()
+        with _batch_db() as db:
+            row = db.execute(
+                "SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' "
+                "AND status='ACTIVE' AND (cooldown_until IS NULL OR cooldown_until<=?) "
+                "ORDER BY last_success DESC LIMIT 1", (_creative_now(),)
+            ).fetchone()
+        if not row:
+            return False, "🔴 Google Flow chưa CONNECTED: chưa có Account ACTIVE."
+        global _CREATIVE_FLOW_ADAPTER
+        if _CREATIVE_FLOW_ADAPTER is None:
+            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        result = _CREATIVE_FLOW_ADAPTER.health_check(str(row["account_id"]))
+        if not result.get("ok"):
+            return False, f"🔴 Google Flow NOT CONNECTED: {result.get('detail','Unknown')}"
+        return True, "🟢 Google Flow CONNECTED · Playwright + Browser + Session OK"
+    except Exception as exc:
+        return False, f"🔴 Google Flow CONNECT ERROR: {str(exc)[:700]}"
+
+def _save_image_engine_setting(engine):
+    engine = str(engine or "GOOGLE_FLOW").upper().strip()
+    if engine not in {"GOOGLE_FLOW", "Z_IMAGE"}:
+        engine = "GOOGLE_FLOW"
+    SETTINGS["selected_image_engine"] = engine
+    save_settings()
+    ok, detail = _creative_environment_check(engine)
+    workflow_cmd_log("CONFIG", "IMAGE_ENGINE_SELECTED", engine=engine, connected=bool(ok), detail=detail)
+    return detail
+
+def _check_image_engine_ui(engine):
+    ok, detail = _creative_environment_check(engine)
+    workflow_cmd_log("CONFIG", "IMAGE_ENGINE_CHECK", engine=str(engine or _selected_image_engine()), connected=bool(ok), detail=detail, level="INFO" if ok else "WARN")
+    return detail
+
 
 def _creative_scene_metadata(scene):
     scene = scene if isinstance(scene, dict) else {}
@@ -15805,6 +15866,25 @@ def launch_ui():
                     cfg_save = gr.Button('💾 Lưu cấu hình & Cập nhật', variant='primary')
                     cfg_use = gr.Button('▶ Sử dụng', variant='primary')
                     cfg_delete = gr.Button('🗑 Xóa')
+                gr.Markdown("### 🎨 Môi trường tạo ảnh")
+                image_engine = gr.Radio(
+                    choices=CREATIVE_IMAGE_ENGINE_CHOICES,
+                    value=_selected_image_engine(),
+                    label="Chọn engine Master",
+                    info="Chỉ chạy engine được chọn. Không tự fallback sang engine khác."
+                )
+                with gr.Row():
+                    image_engine_check = gr.Button("🔌 KIỂM TRA KẾT NỐI", variant="primary")
+                    image_engine_status = gr.Markdown("🟡 Chưa VERIFY kết nối engine.")
+                image_engine.change(
+                    _wrap_gradio_callback(_save_image_engine_setting),
+                    image_engine, image_engine_status, show_progress="minimal"
+                )
+                image_engine_check.click(
+                    _wrap_gradio_callback(_check_image_engine_ui),
+                    image_engine, image_engine_status, show_progress="minimal"
+                )
+
                 with gr.Row():
                     cfg_language = gr.Dropdown(choices=[('🤖 Auto','auto')]+[(language_label(k),k) for k in LANGUAGE_CATALOG], value=SETTINGS.get('selected_language','auto'), label='Ngôn ngữ')
                     _cfg_lang0 = SETTINGS.get('selected_language','auto') or 'auto'
