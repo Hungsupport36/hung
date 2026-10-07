@@ -20495,12 +20495,14 @@ def _flow_external_playwright_driver():
             workflow_cmd_log("PLAYWRIGHT", "BUNDLED_DRIVER_CANDIDATE_FAILED", path=str(raw), error=str(exc)[:500], level="DEBUG")
     return ""
 
+_PLAYWRIGHT_PREPARE_RUNTIME_ORIGINAL_V1161 = _playwright_prepare_runtime
+
 def _playwright_prepare_runtime_v1161():
     external = _flow_external_playwright_driver()
     if external:
         return external
     try:
-        return _playwright_prepare_runtime()
+        return _PLAYWRIGHT_PREPARE_RUNTIME_ORIGINAL_V1161()
     except Exception:
         return ""
 _playwright_prepare_runtime = _playwright_prepare_runtime_v1161
