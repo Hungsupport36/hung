@@ -4951,6 +4951,43 @@ def _creative_studio_timeline_ui(project):
     return f"🧭 Timeline đã tạo: {out}"
 
 
+
+
+# V11.6.4: Master handoff is engine-neutral. Google Flow must never be
+# blocked by a stale Z-Image-specific gate.
+def _master_zimage_after_prompt_ui_v7(project, handoff_status=""):
+    project = _batch_project_name(project)
+    if _master_is_stopped():
+        yield _workflow_progress_card("⏹ MASTER đã dừng — chưa dispatch Job.", 0, "creative")
+        return
+    scenes = load_manifest(project)
+    if not scenes:
+        yield _workflow_progress_card("⛔ Không có Scene để tạo Job.", 100, "creative")
+        return
+    engine = _creative_image_engine_ui_value(_selected_image_engine())
+    if engine == CREATIVE_ENGINE_FLOW and not _creative_engine_available(CREATIVE_ENGINE_FLOW):
+        yield _workflow_progress_card(
+            "🔴 Google Flow chưa CONNECTED/ACTIVE — VERIFY Profile trước.", 100, "creative"
+        )
+        return
+    try:
+        _creative_master_full(project, scenes, engine, start=True)
+        workflow_cmd_log(
+            "MASTER", "CREATIVE_JOBS_CREATED",
+            project=project, scene_count=len(scenes), requested_engine=engine
+        )
+        yield _workflow_progress_card(
+            f"🟢 Creative Studio đã nhận {len(scenes)} Scene · Engine={engine}",
+            5, "creative"
+        )
+    except Exception as exc:
+        workflow_cmd_log("MASTER", "CREATIVE_JOBS_CREATE_FAILED",
+                         project=project, error=str(exc)[:1500], level="ERROR")
+        yield _workflow_progress_card(
+            f"🔴 Không tạo Creative Jobs: {str(exc)[:800]}", 100, "creative"
+        )
+
+
 with gr.Tabs(elem_id='main-workflow-tabs') as main_tabs:
             # UI SOURCE OF TRUTH: top-level Gradio tabs; Độc Lập is the dedicated standalone workspace. Every direct child of gr.Tabs MUST be gr.Tab/gr.TabItem.
             # =================================================
