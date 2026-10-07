@@ -14708,8 +14708,8 @@ def _creative_flow_manual_profile_open(profile_path=""):
     except Exception as exc:
         return _creative_account_pool_html(), f"🔴 Không mở được Profile: {str(exc)[:1000]}", ""
 
-def _creative_flow_manual_profile_verify_sync(account_id):
-    """Run the real Flow VERIFY entirely outside Gradio's asyncio event loop."""
+async def _creative_flow_manual_profile_verify_async(account_id):
+    """VERIFY Flow bằng Playwright ASYNC API, tuyệt đối không dùng Sync API trong callback."""
     aid = str(account_id or "").strip()
     if not aid:
         return _creative_account_pool_html(), "🔴 Chưa có Profile/Account đang kiểm tra."
@@ -14717,55 +14717,124 @@ def _creative_flow_manual_profile_verify_sync(account_id):
     row = _creative_get_account(aid)
     if not row:
         return _creative_account_pool_html(), f"🔴 Không tìm thấy {aid}."
-    try:
-        global _CREATIVE_FLOW_ADAPTER
-        if _CREATIVE_FLOW_ADAPTER is None:
-            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
-        # IMPORTANT: every Playwright Sync API operation below stays in this
-        # dedicated worker thread, never in Gradio's asyncio event-loop thread.
-        pw, browser, page = _CREATIVE_FLOW_ADAPTER._context(aid)
-        result = _CREATIVE_FLOW_ADAPTER.health_check(aid)
-        ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
-        detail = result.get("detail", "") if isinstance(result, dict) else str(result)
-        if not ok:
-            status = "CAPTCHA" if "captcha" in str(detail).lower() else "AUTH_ERROR"
-            _creative_set_account_state(aid, status, detail[:1500])
-            return _creative_account_pool_html(), f"🔴 {aid} chưa ACTIVE · {detail}"
-        identity = _flow_detect_account_identity(page)
-        saved, cookie_file = _flow_persist_storage_state(aid, browser=browser)
-        if not saved:
-            _creative_set_account_state(aid, "AUTH_ERROR", f"Không lưu được session: {cookie_file}")
-            return _creative_account_pool_html(), f"🔴 Session khỏe nhưng không lưu được cookie/session: {cookie_file}"
-        now = _creative_now()
-        label = identity or aid
-        with _batch_db() as db:
-            db.execute(
-                "UPDATE creative_accounts SET status='ACTIVE',account_label=?,cookie_file=?,session_health='HEALTHY',"
-                "last_health_check=?,last_success=?,last_error=NULL,updated_at=? WHERE account_id=?",
-                (label, str(cookie_file), now, now, now, aid)
-            )
-        workflow_cmd_log("FLOW_POOL", "PROFILE_VERIFIED_ACTIVE", account_id=aid, identity=label, cookie_file=str(cookie_file))
-        return _creative_account_pool_html(), (
-            f"🟢 {aid} → ACTIVE · Account: {label}\n"
-            f"🍪 Session/cookie snapshot đã lưu trong tool: {cookie_file}"
-        )
-    except Exception as exc:
-        _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
-        return _creative_account_pool_html(), f"🔴 VERIFY PROFILE lỗi {aid}: {str(exc)[:1000]}"
 
-_FLOW_VERIFY_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="VHUNG-FlowVerify"
-)
+    profile = str((row or {}).get("session_profile") or "").strip()
+    if not profile:
+        return _creative_account_pool_html(), f"🔴 {aid} chưa có thư mục Profile."
+
+    port = int((row or {}).get("debug_port") or _flow_debug_port(aid))
+    try:
+        if not _flow_cdp_ready(port, timeout=3):
+            p = Path(profile).expanduser().resolve()
+            p.mkdir(parents=True, exist_ok=True)
+            _flow_launch_stable_chrome(aid, str(p), GoogleFlowAdapter.FLOW_URL)
+            if not _flow_cdp_ready(port, timeout=15):
+                raise RuntimeError(f"Chrome đã được gọi mở lại nhưng CDP chưa sẵn sàng cho {aid}.")
+
+        # IMPORTANT: VERIFY uses ONLY Playwright Async API.
+        # It is intentionally independent from any Sync Playwright objects
+        # stored in GoogleFlowAdapter._contexts. This removes the
+        # "Sync API inside the asyncio loop" failure completely.
+        from playwright.async_api import async_playwright
+
+        async with async_playwright() as pw:
+            browser = await pw.chromium.connect_over_cdp(
+                f"http://127.0.0.1:{port}", timeout=15000
+            )
+            contexts = browser.contexts
+            if not contexts:
+                raise RuntimeError(f"Chrome CDP connected nhưng không có BrowserContext: {aid}")
+            context = contexts[0]
+            pages = context.pages
+            page = pages[0] if pages else await context.new_page()
+
+            if not page.url or "flow" not in page.url.lower():
+                try:
+                    await page.goto(
+                        GoogleFlowAdapter.FLOW_URL,
+                        wait_until="domcontentloaded",
+                        timeout=60000,
+                    )
+                except Exception:
+                    pass
+
+            body = ""
+            try:
+                body = (await page.locator("body").inner_text(timeout=5000) or "").lower()
+            except Exception:
+                pass
+
+            captcha_markers = (
+                "captcha", "verify you are human", "unusual traffic", "security check"
+            )
+            if any(x in body for x in captcha_markers):
+                _creative_set_account_state(
+                    aid, "CAPTCHA", "Google Flow yêu cầu CAPTCHA."
+                )
+                return _creative_account_pool_html(), (
+                    f"🔴 {aid} chưa ACTIVE · CAPTCHA đang yêu cầu xử lý."
+                )
+
+            auth_markers = (
+                "sign in", "log in", "đăng nhập", "sign-in", "accounts.google.com"
+            )
+            # A Google account page is not itself proof of logout. Only mark
+            # AUTH_ERROR when the visible page clearly exposes a sign-in state.
+            if any(x in body for x in auth_markers) and "flow" not in body:
+                detail = "Flow session chưa đăng nhập Google/Flow."
+                _creative_set_account_state(aid, "AUTH_ERROR", detail)
+                return _creative_account_pool_html(), f"🔴 {aid} chưa ACTIVE · {detail}"
+
+            identity = ""
+            try:
+                text_body = await page.locator("body").inner_text(timeout=3000) or ""
+                emails = re.findall(
+                    r"\\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}\\b",
+                    text_body,
+                    flags=re.I,
+                )
+                identity = emails[0].strip().lower() if emails else ""
+            except Exception:
+                pass
+
+            root, cookie_file = _flow_storage_paths(aid)
+            try:
+                await context.storage_state(path=str(cookie_file))
+            except Exception as exc:
+                _creative_set_account_state(
+                    aid, "AUTH_ERROR", f"Không lưu được session: {exc}"
+                )
+                return _creative_account_pool_html(), (
+                    f"🔴 Session mở được nhưng không lưu được cookie/session: {exc}"
+                )
+
+            now = _creative_now()
+            label = identity or str((row or {}).get("account_label") or aid)
+            with _batch_db() as db:
+                db.execute(
+                    "UPDATE creative_accounts SET status='ACTIVE',account_label=?,"
+                    "cookie_file=?,session_health='HEALTHY',last_health_check=?,"
+                    "last_success=?,last_error=NULL,updated_at=? WHERE account_id=?",
+                    (label, str(cookie_file), now, now, now, aid),
+                )
+
+            workflow_cmd_log(
+                "FLOW_POOL", "PROFILE_VERIFIED_ACTIVE",
+                account_id=aid, identity=label, cookie_file=str(cookie_file)
+            )
+            return _creative_account_pool_html(), (
+                f"🟢 {aid} → ACTIVE · Account: {label}\\n"
+                f"🍪 Session/cookie snapshot đã lưu trong tool: {cookie_file}"
+            )
+    except Exception as exc:
+        detail = str(exc)[:1500]
+        _creative_set_account_state(aid, "AUTH_ERROR", detail)
+        return _creative_account_pool_html(), f"🔴 VERIFY PROFILE lỗi {aid}: {detail[:1000]}"
+
 
 async def _creative_flow_manual_profile_verify(account_id):
-    """Async UI callback; delegate all Playwright Sync API work to a real thread."""
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(
-        _FLOW_VERIFY_EXECUTOR,
-        lambda: contextvars.copy_context().run(
-            _creative_flow_manual_profile_verify_sync, account_id
-        ),
-    )
+    """UI callback; VERIFY itself uses Playwright Async API only."""
+    return await _creative_flow_manual_profile_verify_async(account_id)
 
 def _creative_account_pool_html(limit=100):
     """Render account pool with local profile/identity state."""
