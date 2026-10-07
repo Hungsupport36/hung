@@ -14541,6 +14541,195 @@ def _creative_flow_pool_verify_registered():
         f"🟢 VERIFY session đang mở: {checked} · ACTIVE: {active}. Không tự mở 1000 browser cùng lúc."
     )
 
+
+# ---------- Flow account onboarding: profile -> manual login -> persist session ----------
+FLOW_ACCOUNT_ROOT = APP_STATE_DIR / "flow_accounts"
+FLOW_ACCOUNT_ROOT.mkdir(parents=True, exist_ok=True)
+FLOW_PROFILE_ROOT = APP_STATE_DIR / "flow_profiles"
+FLOW_PROFILE_ROOT.mkdir(parents=True, exist_ok=True)
+
+def _flow_account_schema():
+    """Add local-only identity/session fields without breaking existing V9 databases."""
+    _creative_v3_migrate()
+    with _batch_db() as db:
+        cols = {str(r[1]) for r in db.execute("PRAGMA table_info(creative_accounts)").fetchall()}
+        if "account_label" not in cols:
+            db.execute("ALTER TABLE creative_accounts ADD COLUMN account_label TEXT")
+        if "cookie_file" not in cols:
+            db.execute("ALTER TABLE creative_accounts ADD COLUMN cookie_file TEXT")
+
+def _flow_next_profile_id():
+    _flow_account_schema()
+    with _batch_db() as db:
+        rows = db.execute("SELECT account_id FROM creative_accounts WHERE provider='GOOGLE_FLOW' AND account_id LIKE 'FLOW-%'").fetchall()
+    nums = []
+    for row in rows:
+        m = re.fullmatch(r"FLOW-(\d+)", str(row[0] or ""))
+        if m:
+            nums.append(int(m.group(1)))
+    return f"FLOW-{(max(nums) + 1) if nums else 1:04d}"
+
+def _flow_storage_paths(account_id):
+    safe = safe_name(account_id)
+    root = FLOW_ACCOUNT_ROOT / safe
+    root.mkdir(parents=True, exist_ok=True)
+    return root, root / "storage_state.json"
+
+def _flow_detect_account_identity(page):
+    """Best-effort identity label from the signed-in Flow/Google UI."""
+    try:
+        body = page.locator("body").inner_text(timeout=3000) or ""
+    except Exception:
+        body = ""
+    emails = re.findall(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", body, flags=re.I)
+    return emails[0].strip().lower() if emails else ""
+
+def _flow_persist_storage_state(account_id, browser=None, page=None):
+    """Persist a Playwright storage_state snapshot under the tool-owned account folder."""
+    root, cookie_file = _flow_storage_paths(account_id)
+    try:
+        if browser is not None:
+            browser.storage_state(path=str(cookie_file))
+        elif page is not None:
+            page.context.storage_state(path=str(cookie_file))
+        else:
+            return False, "Không có browser/page để lưu session."
+        return True, str(cookie_file)
+    except Exception as exc:
+        return False, str(exc)
+
+def _flow_create_manual_profile(profile_path=""):
+    """Create/register a profile; user performs Google/Flow login manually."""
+    _flow_account_schema()
+    aid = _flow_next_profile_id()
+    p = Path(str(profile_path).strip()).expanduser().resolve() if str(profile_path or "").strip() else FLOW_PROFILE_ROOT / safe_name(aid)
+    p.mkdir(parents=True, exist_ok=True)
+    now = _creative_now()
+    with _batch_db() as db:
+        db.execute(
+            "INSERT INTO creative_accounts(account_id,provider,status,session_profile,account_label,cookie_file,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (aid, "GOOGLE_FLOW", "DISABLED", str(p), "", str(_flow_storage_paths(aid)[1]), now, now)
+        )
+    workflow_cmd_log("FLOW_POOL", "PROFILE_REGISTERED", account_id=aid, profile=str(p))
+    return aid, str(p)
+
+def _creative_flow_manual_profile_open(profile_path=""):
+    """Open a new profile, then let the user log into Google/Flow manually."""
+    try:
+        aid, profile = _flow_create_manual_profile(profile_path)
+        global _CREATIVE_FLOW_ADAPTER
+        if _CREATIVE_FLOW_ADAPTER is None:
+            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        _CREATIVE_FLOW_ADAPTER._context(aid)
+        return _creative_account_pool_html(), (
+            f"🟡 Đã mở {aid} · Profile: {profile}\n\n"
+            "👉 Tự đăng nhập Google/Flow trên cửa sổ vừa mở. Đăng nhập xong bấm VERIFY PROFILE."
+        ), aid
+    except Exception as exc:
+        return _creative_account_pool_html(), f"🔴 Không mở được Profile: {str(exc)[:1000]}", ""
+
+def _creative_flow_manual_profile_verify(account_id):
+    """Verify manual login, persist session state, and activate the profile."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return _creative_account_pool_html(), "🔴 Chưa có Profile/Account đang kiểm tra."
+    _flow_account_schema()
+    row = _creative_get_account(aid)
+    if not row:
+        return _creative_account_pool_html(), f"🔴 Không tìm thấy {aid}."
+    try:
+        global _CREATIVE_FLOW_ADAPTER
+        if _CREATIVE_FLOW_ADAPTER is None:
+            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        pw, browser, page = _CREATIVE_FLOW_ADAPTER._context(aid)
+        result = _CREATIVE_FLOW_ADAPTER.health_check(aid)
+        ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+        detail = result.get("detail", "") if isinstance(result, dict) else str(result)
+        if not ok:
+            status = "CAPTCHA" if "captcha" in str(detail).lower() else "AUTH_ERROR"
+            _creative_set_account_state(aid, status, detail[:1500])
+            return _creative_account_pool_html(), f"🔴 {aid} chưa ACTIVE · {detail}"
+        identity = _flow_detect_account_identity(page)
+        saved, cookie_file = _flow_persist_storage_state(aid, browser=browser)
+        if not saved:
+            _creative_set_account_state(aid, "AUTH_ERROR", f"Không lưu được session: {cookie_file}")
+            return _creative_account_pool_html(), f"🔴 Session khỏe nhưng không lưu được cookie/session: {cookie_file}"
+        now = _creative_now()
+        label = identity or aid
+        with _batch_db() as db:
+            db.execute(
+                "UPDATE creative_accounts SET status='ACTIVE',account_label=?,cookie_file=?,session_health='HEALTHY',"
+                "last_health_check=?,last_success=?,last_error=NULL,updated_at=? WHERE account_id=?",
+                (label, str(cookie_file), now, now, now, aid)
+            )
+        workflow_cmd_log("FLOW_POOL", "PROFILE_VERIFIED_ACTIVE", account_id=aid, identity=label, cookie_file=str(cookie_file))
+        return _creative_account_pool_html(), (
+            f"🟢 {aid} → ACTIVE · Account: {label}\n"
+            f"🍪 Session/cookie snapshot đã lưu trong tool: {cookie_file}"
+        )
+    except Exception as exc:
+        _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
+        return _creative_account_pool_html(), f"🔴 VERIFY PROFILE lỗi {aid}: {str(exc)[:1000]}"
+
+def _creative_account_pool_html(limit=100):
+    """Render account pool with local profile/identity state."""
+    _flow_account_schema()
+    summary = _creative_account_pool_summary()
+    limit = max(10, min(int(limit or 100), 500))
+    with _batch_db() as db:
+        rows = db.execute(
+            "SELECT account_id,status,usage,quota,session_health,account_label,session_profile "
+            "FROM creative_accounts WHERE provider='GOOGLE_FLOW' ORDER BY account_id LIMIT ?", (limit,)
+        ).fetchall()
+    parts = [
+        "<div class='batch-center-card'>",
+        "<b>🌐 GOOGLE FLOW ACCOUNT POOL</b>",
+        f"<div>TỔNG <b>{summary['total']}</b> · 🟢 ACTIVE <b>{summary['active']}</b> · "
+        f"🟡 BUSY <b>{summary['busy']} · 🟠 COOLDOWN <b>{summary['cooldown']} · "
+        f"🔴 CAPTCHA <b>{summary['captcha']} · ⚫ AUTH <b>{summary['auth_error']}</b></div>",
+        "<hr><div>Profile được mở bằng Playwright. Đăng nhập Google/Flow thủ công. "
+        "Sau VERIFY, tool lưu session/cookie snapshot trong thư mục tool.</div>"
+    ]
+    if not rows:
+        parts.append("<div>🟡 Chưa có Profile Google Flow.</div>")
+    else:
+        parts.append("<div style='font-family:monospace;font-size:12px;line-height:1.65'><b>PROFILE | ACCOUNT | STATUS | SESSION</b><br>")
+        for row in rows:
+            parts.append(
+                f"{html.escape(str(row['account_id']))} | {html.escape(str(row['account_label'] or 'chưa nhận diện'))} | "
+                f"{html.escape(str(row['status']))} | {html.escape(str(row['session_health'] or 'UNKNOWN'))}<br>"
+            )
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+_V9_FLOW_CONTEXT = GoogleFlowAdapter._context
+def _flow_context_registered_profile(self, account_id):
+    row = _creative_get_account(account_id)
+    profile = str((row or {}).get("session_profile") or "").strip()
+    if not profile:
+        return _V9_FLOW_CONTEXT(self, account_id)
+    try:
+        item = self._contexts.get(account_id)
+        if item:
+            pw, browser, page = item
+            if browser.is_connected() and not page.is_closed():
+                return item
+    except Exception:
+        pass
+    from playwright.sync_api import sync_playwright
+    p = Path(profile).expanduser().resolve()
+    p.mkdir(parents=True, exist_ok=True)
+    pw = sync_playwright().start()
+    browser = pw.chromium.launch_persistent_context(str(p), headless=False)
+    page = browser.pages[0] if browser.pages else browser.new_page()
+    page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+    self._contexts[account_id] = (pw, browser, page)
+    return self._contexts[account_id]
+
+GoogleFlowAdapter._context = _flow_context_registered_profile
+
 def launch_ui():
     _cleanup_gradio_temp(force=True)
     workflow_cmd_log('SUPERVISOR', 'STARTUP_HEALTH', project='', health=background_health_snapshot())
@@ -16107,48 +16296,37 @@ def launch_ui():
                     image_engine, image_engine_status, show_progress="minimal"
                 )
 
-                gr.Markdown("### 👥 Google Flow Account Pool — hỗ trợ hàng nghìn Account")
-                flow_pool_raw = gr.Textbox(
-                    label="📥 Import Account hàng loạt",
-                    lines=6,
-                    placeholder="Mỗi dòng: account_id\\nhoặc: account_id|profile_path\\nCó thể dán JSON accounts[]",
-                    info="Đây chỉ là đăng ký Pool. Account phải có session Google/Flow thật và được VERIFY mới thành ACTIVE."
+                gr.Markdown("### 👥 Google Flow Account Pool — đăng nhập Profile thủ công")
+                flow_pool_profile_path = gr.Textbox(
+                    label="📁 Profile folder (để trống = tool tự tạo Profile mới)",
+                    placeholder="Ví dụ: F:\\FlowProfiles\\Profile001",
+                    info="Mỗi lần MỞ PROFILE MỚI sẽ tạo một Profile/Account record riêng. Bạn tự đăng nhập Google/Flow."
                 )
                 with gr.Row():
-                    flow_pool_import = gr.Button("📥 IMPORT POOL", variant="primary")
-                    flow_pool_replace = gr.Checkbox(label="Thay toàn bộ Pool hiện tại", value=False)
+                    flow_pool_new = gr.Button("➕ MỞ PROFILE MỚI", variant="primary")
+                    flow_pool_verify = gr.Button("🔌 VERIFY PROFILE", variant="primary")
                     flow_pool_refresh = gr.Button("🔄 REFRESH POOL")
-                with gr.Row():
-                    flow_pool_account = gr.Textbox(label="Account ID cần mở/VERIFY", scale=2)
-                    flow_pool_open = gr.Button("🌐 MỞ SESSION", scale=1)
-                    flow_pool_verify = gr.Button("🔌 VERIFY ACCOUNT", scale=1)
-                    flow_pool_verify_open = gr.Button("🔍 VERIFY SESSION ĐANG MỞ", scale=1)
+                flow_pool_account = gr.Textbox(label="Profile ID đang mở", placeholder="FLOW-0001", value="")
                 flow_pool_status = gr.Markdown(_creative_account_pool_html())
-
-                flow_pool_import.click(
-                    _wrap_gradio_callback(_creative_import_flow_accounts),
-                    [flow_pool_raw, flow_pool_replace],
-                    [flow_pool_status, image_engine_status],
+                flow_pool_hint = gr.Markdown(
+                    "🟡 Quy trình: MỞ PROFILE MỚI → tự đăng nhập Google/Flow → VERIFY PROFILE → "
+                    "tool tự lưu Account + cookie/session vào thư mục tool."
+                )
+                flow_pool_new.click(
+                    _wrap_gradio_callback(_creative_flow_manual_profile_open),
+                    flow_pool_profile_path,
+                    [flow_pool_status, flow_pool_hint, flow_pool_account],
+                    show_progress="minimal"
+                )
+                flow_pool_verify.click(
+                    _wrap_gradio_callback(_creative_flow_manual_profile_verify),
+                    flow_pool_account,
+                    [flow_pool_status, flow_pool_hint],
                     show_progress="minimal"
                 )
                 flow_pool_refresh.click(
                     _wrap_gradio_callback(lambda: _creative_account_pool_html()),
                     None, flow_pool_status, show_progress="hidden"
-                )
-                flow_pool_open.click(
-                    _wrap_gradio_callback(_creative_flow_account_open),
-                    flow_pool_account, [flow_pool_status, image_engine_status],
-                    show_progress="minimal"
-                )
-                flow_pool_verify.click(
-                    _wrap_gradio_callback(_creative_flow_account_verify),
-                    flow_pool_account, [flow_pool_status, image_engine_status],
-                    show_progress="minimal"
-                )
-                flow_pool_verify_open.click(
-                    _wrap_gradio_callback(_creative_flow_pool_verify_registered),
-                    None, [flow_pool_status, image_engine_status],
-                    show_progress="minimal"
                 )
 
                 with gr.Row():
