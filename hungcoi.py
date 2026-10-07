@@ -4960,7 +4960,110 @@ with gr.Tabs(elem_id='main-workflow-tabs') as main_tabs:
             # ENVIRONMENT + VOICE SAMPLE / CLONE
             # Tab đầu tiên: chỉ kiểm tra server có hoạt động hay không.
             # Không cài/update/model/start/stop server từ UI ở đây.
-            with gr.Tab('⚙ Môi trường'):
+            
+            # =================================================
+            # CREATIVE STUDIO — BATCH EXECUTION
+            # =================================================
+            with gr.Tab('🎬 Creative Studio'):
+                gr.Markdown(
+                    "## 🎬 Creative Studio — Xử lý hàng loạt\n"
+                    "**Flow:** Create Project → Scene → Prompt → Generate → Download → Verify → Scene tiếp theo."
+                )
+                with gr.Row():
+                    creative_project = gr.Textbox(
+                        value=str(SETTINGS.get("selected_project") or ""),
+                        label="📁 Project",
+                        placeholder="Tên Project đã có Scene/Prompt"
+                    )
+                    creative_engine = gr.Radio(
+                        choices=CREATIVE_IMAGE_ENGINE_CHOICES,
+                        value=_selected_image_engine(),
+                        label="🖼 Engine ảnh",
+                        scale=2
+                    )
+                creative_status = gr.Markdown(_creative_studio_status_ui(SETTINGS.get("selected_project", "")))
+                with gr.Row():
+                    creative_start = gr.Button("🖼 Tạo Ảnh & Video AI Hàng Loạt", variant="primary")
+                    creative_postclean = gr.Button("🎞 Xử Lý Hậu Kỳ / Xóa AI Hàng Loạt")
+                    creative_depth = gr.Button("🌀 Chuyển Động Chiều Sâu Hàng Loạt")
+                    creative_motion = gr.Button("🎛 Motion Control Hàng Loạt")
+                with gr.Row():
+                    creative_pause = gr.Button("⏸ PAUSE")
+                    creative_resume = gr.Button("▶ RESUME")
+                    creative_stop = gr.Button("⏹ STOP")
+                    creative_refresh = gr.Button("🔄 REFRESH")
+                    creative_timeline = gr.Button("🧭 TẠO TIMELINE")
+                creative_action_status = gr.Markdown("🟡 Chưa chạy Creative Studio.")
+                creative_queue = gr.HTML(
+                    _creative_studio_queue_html(SETTINGS.get("selected_project", "")),
+                    elem_id="creative-studio-queue"
+                )
+
+                gr.Markdown("### ⚙️ Cấu hình Studio")
+                with gr.Row():
+                    creative_worker_count = gr.Number(
+                        value=1, precision=0, minimum=1, maximum=8,
+                        label="Worker"
+                    )
+                    creative_retry_count = gr.Number(
+                        value=CREATIVE_MAX_RETRY, precision=0, minimum=0, maximum=10,
+                        label="Retry tối đa"
+                    )
+                    creative_result_timeout = gr.Number(
+                        value=CREATIVE_FLOW_RESULT_TIMEOUT, precision=0, minimum=60,
+                        label="Flow timeout (giây)"
+                    )
+                    creative_config_status = gr.Markdown(
+                        "Flow dùng 1 worker/profile để tránh cùng Chrome bị attach đồng thời."
+                    )
+                gr.Markdown(
+                    "### 📋 Bảng nhiệm vụ\n"
+                    "Queue lưu SQLite: **Queue → Running → Retry → Failed/CAPTCHA → Completed**. "
+                    "Không mở worker thứ hai cho cùng Flow profile."
+                )
+
+                creative_start.click(
+                    _wrap_gradio_callback(_creative_studio_create_run_ui),
+                    [creative_project, creative_engine],
+                    [creative_action_status, creative_queue],
+                    show_progress="minimal"
+                )
+                creative_postclean.click(
+                    _wrap_gradio_callback(_creative_studio_create_run_ui),
+                    [creative_project, creative_engine],
+                    [creative_action_status, creative_queue],
+                    show_progress="minimal"
+                )
+                creative_depth.click(
+                    _wrap_gradio_callback(_creative_studio_depth_ui),
+                    creative_project, creative_action_status, show_progress="minimal"
+                )
+                creative_motion.click(
+                    _wrap_gradio_callback(_creative_studio_motion_ui),
+                    creative_project, creative_action_status, show_progress="minimal"
+                )
+                creative_pause.click(
+                    _wrap_gradio_callback(_creative_studio_pause_ui),
+                    creative_project, creative_action_status, show_progress="minimal"
+                )
+                creative_resume.click(
+                    _wrap_gradio_callback(_creative_studio_resume_ui),
+                    creative_project, creative_action_status, show_progress="minimal"
+                )
+                creative_stop.click(
+                    _wrap_gradio_callback(_creative_studio_stop_ui),
+                    creative_project, creative_action_status, show_progress="minimal"
+                )
+                creative_refresh.click(
+                    _wrap_gradio_callback(_creative_studio_refresh_ui),
+                    creative_project, [creative_status, creative_queue], show_progress="hidden"
+                )
+                creative_timeline.click(
+                    _wrap_gradio_callback(_creative_studio_timeline_ui),
+                    creative_project, creative_action_status, show_progress="minimal"
+                )
+
+with gr.Tab('⚙ Môi trường'):
                 gr.Markdown('### 💾 Cấu hình workflow — lưu nhiều cấu hình')
                 cfg_preview = gr.Markdown(
                     profile_preview_rows(current_workflow_profile()),
