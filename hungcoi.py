@@ -163,7 +163,7 @@ ENGINE_STATE_FILE = SERVERS / "engine_state.json"
 # IMPORTANT:
 # - This layer never fakes Google Flow execution.
 # - A real Playwright/Flow provider worker attaches to these contracts.
-# - GOOGLE_FLOW is PRIMARY; Z_IMAGE is FALLBACK; FLUX is not registered.
+# - GOOGLE_FLOW is PRIMARY; Z_IMAGE is LOCAL ALTERNATIVE; FLUX is not registered.
 
 CREATIVE_JOB_STAGES = ("IMAGE", "DEPTH", "MOTION", "POSTPROCESS", "QC", "TIMELINE")
 CREATIVE_MAX_RETRY = 3
@@ -1364,7 +1364,7 @@ CREATIVE_ERROR_CLASSES = (
     "OUTPUT_INVALID", "WORKER_CRASH", "BROWSER_CRASH", "SERVER_BUSY",
 )
 CREATIVE_RETRYABLE_ERRORS = {"NETWORK_ERROR", "TIMEOUT", "FLOW_UNAVAILABLE", "SERVER_BUSY", "OUTPUT_INVALID", "WORKER_CRASH", "BROWSER_CRASH"}
-CREATIVE_FALLBACK_ERRORS = {"FLOW_UNAVAILABLE"}
+CREATIVE_FALLBACK_ERRORS = set()
 CREATIVE_COOLDOWN_SECONDS = int(os.getenv("VHUNG_FLOW_COOLDOWN_SECONDS", "300") or 300)
 
 class CreativeRateLimited(RuntimeError): pass
@@ -1671,7 +1671,7 @@ def _creative_retry_v3(job_id,error_class,error_text,account_id=None,allow_fallb
                            (job_id,n,str(error_text)[:1500],ec,now))
                 return "RETRY"
             # Max Flow retries reached. AUTO may use policy fallback, but only after retry budget is exhausted.
-            if str(requested).upper()==CREATIVE_ENGINE_AUTO and bool(fallback_allowed) and allow_fallback and ec in CREATIVE_FALLBACK_ERRORS:
+            if False and str(requested).upper()==CREATIVE_ENGINE_AUTO and bool(fallback_allowed) and allow_fallback and ec in CREATIVE_FALLBACK_ERRORS:
                 db.execute("UPDATE creative_jobs SET status='READY',actual_engine=NULL,error_class=?,error=?,fallback_reason='Đã hết retry Flow; policy cho phép chuyển Z Image.',retry_count=0,ready_at=?,worker_id=NULL,account_id=NULL,updated_at=? WHERE job_id=?",
                            (ec,str(error_text)[:1500],now,now,job_id))
                 return "FALLBACK_READY"
@@ -14319,6 +14319,228 @@ _master_zimage_after_prompt_ui = _master_zimage_after_prompt_ui_v7
 # Clean UI text: production path is Hình ảnh/ZImage, legacy FluxJS only exists
 # in migration code and is never used as an engine.
 
+
+def _creative_account_pool_summary():
+    """Compact account-pool summary for large Flow pools (1000+ accounts)."""
+    _creative_v3_migrate()
+    _creative_refresh_cooldowns()
+    with _batch_db() as db:
+        rows = db.execute(
+            "SELECT status, COUNT(*) AS n FROM creative_accounts "
+            "WHERE provider='GOOGLE_FLOW' GROUP BY status ORDER BY status"
+        ).fetchall()
+        total = db.execute(
+            "SELECT COUNT(*) FROM creative_accounts WHERE provider='GOOGLE_FLOW'"
+        ).fetchone()[0]
+    counts = {str(row["status"]): int(row["n"]) for row in rows}
+    return {
+        "total": int(total or 0),
+        "active": counts.get("ACTIVE", 0),
+        "busy": counts.get("BUSY", 0),
+        "cooldown": counts.get("COOLDOWN", 0) + counts.get("RATE_LIMITED", 0),
+        "captcha": counts.get("CAPTCHA", 0),
+        "quota": counts.get("QUOTA", 0),
+        "auth_error": counts.get("AUTH_ERROR", 0),
+        "disabled": counts.get("DISABLED", 0),
+    }
+
+
+def _creative_account_pool_html(limit=100):
+    """Render a bounded account table; never dump 1000+ rows into the Gradio DOM."""
+    _creative_v3_migrate()
+    summary = _creative_account_pool_summary()
+    limit = max(10, min(int(limit or 100), 500))
+    with _batch_db() as db:
+        rows = db.execute(
+            "SELECT account_id,status,usage,quota,cooldown_until,session_health,last_health_check "
+            "FROM creative_accounts WHERE provider='GOOGLE_FLOW' "
+            "ORDER BY account_id LIMIT ?", (limit,)
+        ).fetchall()
+    parts = [
+        "<div class='batch-center-card'>",
+        "<b>🌐 GOOGLE FLOW ACCOUNT POOL</b>",
+        f"<div>TỔNG <b>{summary['total']}</b> · 🟢 ACTIVE <b>{summary['active']}</b> · "
+        f"🟡 BUSY <b>{summary['busy']}</b> · 🟠 COOLDOWN <b>{summary['cooldown']}</b> · "
+        f"🔴 CAPTCHA <b>{summary['captcha']}</b> · ⚫ AUTH <b>{summary['auth_error']}</b></div>",
+        "<hr><div>HIỂN THỊ TỐI ĐA 100 ACCOUNT ĐẦU. Pool vẫn quản lý toàn bộ account.</div>"
+    ]
+    if not rows:
+        parts.append("<div>🟡 Chưa có Account Google Flow.</div>")
+    else:
+        parts.append(
+            "<div style='font-family:monospace;font-size:12px;line-height:1.65'>"
+            "<b>ACCOUNT | STATUS | USAGE | QUOTA | SESSION</b><br>"
+        )
+        for row in rows:
+            parts.append(
+                f"{html.escape(str(row['account_id']))} | "
+                f"{html.escape(str(row['status']))} | "
+                f"{int(row['usage'] or 0)} | "
+                f"{html.escape(str(row['quota'] or 'UNKNOWN'))} | "
+                f"{html.escape(str(row['session_health'] or 'UNKNOWN'))}<br>"
+            )
+        parts.append("</div>")
+    parts.append("</div>")
+    return "".join(parts)
+
+
+def _creative_import_flow_accounts(raw_text, replace=False):
+    """Bulk-register existing Flow accounts. New accounts start DISABLED."""
+    _creative_v3_migrate()
+    raw = str(raw_text or "").strip()
+    if not raw:
+        return _creative_account_pool_html(), "🔴 Chưa có danh sách Account để import."
+
+    records = []
+    try:
+        parsed = json.loads(raw)
+        if isinstance(parsed, dict):
+            parsed = parsed.get("accounts", [])
+        if isinstance(parsed, list):
+            for item in parsed:
+                if isinstance(item, str):
+                    records.append((item.strip(), ""))
+                elif isinstance(item, dict):
+                    aid = str(item.get("account_id") or item.get("email") or item.get("id") or "").strip()
+                    profile = str(item.get("profile_path") or item.get("session_profile") or "").strip()
+                    if aid:
+                        records.append((aid, profile))
+    except Exception:
+        pass
+
+    if not records:
+        for line in raw.splitlines():
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "|" in line:
+                aid, profile = line.split("|", 1)
+            elif "," in line:
+                aid, profile = line.split(",", 1)
+            else:
+                aid, profile = line, ""
+            aid = str(aid).strip()
+            profile = str(profile).strip()
+            if aid:
+                records.append((aid, profile))
+
+    unique = {}
+    for aid, profile in records:
+        key = safe_name(aid)
+        if key:
+            unique[key] = (aid, profile)
+    records = list(unique.values())[:5000]
+    now = _creative_now()
+    added = 0
+    updated = 0
+    with _batch_db() as db:
+        if replace:
+            db.execute("DELETE FROM creative_accounts WHERE provider='GOOGLE_FLOW'")
+        for aid, profile in records:
+            existing = db.execute(
+                "SELECT account_id FROM creative_accounts WHERE account_id=? AND provider='GOOGLE_FLOW'",
+                (aid,)
+            ).fetchone()
+            profile_path = str(Path(profile).expanduser().resolve()) if profile else str(
+                APP_STATE_DIR / "flow_profiles" / safe_name(aid)
+            )
+            if existing:
+                db.execute(
+                    "UPDATE creative_accounts SET session_profile=?,updated_at=? WHERE account_id=?",
+                    (profile_path, now, aid)
+                )
+                updated += 1
+            else:
+                db.execute(
+                    "INSERT INTO creative_accounts(account_id,provider,status,session_profile,created_at,updated_at) "
+                    "VALUES(?,?,?,?,?,?)",
+                    (aid, "GOOGLE_FLOW", "DISABLED", profile_path, now, now)
+                )
+                added += 1
+    workflow_cmd_log("FLOW_POOL", "BULK_IMPORT", total=len(records), added=added, updated=updated, replace=bool(replace))
+    return _creative_account_pool_html(), (
+        f"🟢 Import Pool hoàn tất · {len(records)} dòng · ➕ {added} mới · ♻️ {updated} cập nhật · "
+        "Account mới ở DISABLED cho tới khi session thật được VERIFY."
+    )
+
+
+def _creative_flow_account_open(account_id):
+    """Open one existing account profile for manual Google login/CAPTCHA resolution."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return _creative_account_pool_html(), "🔴 Chưa chọn Account."
+    if not _creative_get_account(aid):
+        return _creative_account_pool_html(), f"🔴 Không tìm thấy Account: {aid}"
+    try:
+        global _CREATIVE_FLOW_ADAPTER
+        if _CREATIVE_FLOW_ADAPTER is None:
+            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        _CREATIVE_FLOW_ADAPTER._context(aid)
+        workflow_cmd_log("FLOW_POOL", "SESSION_OPEN", account_id=aid)
+        return _creative_account_pool_html(), (
+            f"🟡 Đã mở session {aid}. Đăng nhập Google/Flow hoặc xử lý CAPTCHA thủ công, "
+            "sau đó bấm VERIFY Account."
+        )
+    except Exception as exc:
+        _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
+        return _creative_account_pool_html(), f"🔴 Không mở được session {aid}: {str(exc)[:700]}"
+
+
+def _creative_flow_account_verify(account_id):
+    """Verify one real Playwright Flow session and promote it to ACTIVE only if healthy."""
+    aid = str(account_id or "").strip()
+    if not aid:
+        return _creative_account_pool_html(), "🔴 Chưa chọn Account."
+    if not _creative_get_account(aid):
+        return _creative_account_pool_html(), f"🔴 Không tìm thấy Account: {aid}"
+    try:
+        global _CREATIVE_FLOW_ADAPTER
+        if _CREATIVE_FLOW_ADAPTER is None:
+            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
+        result = _CREATIVE_FLOW_ADAPTER.health_check(aid)
+        ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+        detail = result.get("detail", "") if isinstance(result, dict) else str(result)
+        if ok:
+            _creative_set_account_state(aid, "ACTIVE", None, None)
+            with _batch_db() as db:
+                db.execute(
+                    "UPDATE creative_accounts SET session_health='HEALTHY',last_health_check=?,updated_at=? WHERE account_id=?",
+                    (_creative_now(), _creative_now(), aid)
+                )
+            workflow_cmd_log("FLOW_POOL", "ACCOUNT_ACTIVE", account_id=aid, detail=detail)
+            return _creative_account_pool_html(), f"🟢 {aid} ACTIVE · {detail}"
+        status = "CAPTCHA" if "captcha" in str(detail).lower() else "AUTH_ERROR"
+        _creative_set_account_state(aid, status, detail[:1500])
+        return _creative_account_pool_html(), f"🔴 {aid} chưa ACTIVE · {detail}"
+    except Exception as exc:
+        _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
+        return _creative_account_pool_html(), f"🔴 VERIFY lỗi {aid}: {str(exc)[:700]}"
+
+
+def _creative_flow_pool_verify_registered():
+    """Verify only sessions already open in the adapter; do not spawn 1000 browsers."""
+    _creative_v3_migrate()
+    global _CREATIVE_FLOW_ADAPTER
+    if _CREATIVE_FLOW_ADAPTER is None:
+        return _creative_account_pool_html(), (
+            "🟡 Chưa có Playwright Flow session đang mở. Dùng MỞ SESSION cho Account cần kích hoạt."
+        )
+    checked = 0
+    active = 0
+    for aid in list(_CREATIVE_FLOW_ADAPTER._contexts.keys()):
+        checked += 1
+        result = _CREATIVE_FLOW_ADAPTER.health_check(aid)
+        ok = bool(result.get("ok")) if isinstance(result, dict) else bool(result)
+        detail = result.get("detail", "") if isinstance(result, dict) else str(result)
+        if ok:
+            _creative_set_account_state(aid, "ACTIVE", None, None)
+            active += 1
+        else:
+            _creative_set_account_state(aid, "CAPTCHA" if "captcha" in str(detail).lower() else "AUTH_ERROR", detail[:1500])
+    return _creative_account_pool_html(), (
+        f"🟢 VERIFY session đang mở: {checked} · ACTIVE: {active}. Không tự mở 1000 browser cùng lúc."
+    )
+
 def launch_ui():
     _cleanup_gradio_temp(force=True)
     workflow_cmd_log('SUPERVISOR', 'STARTUP_HEALTH', project='', health=background_health_snapshot())
@@ -15883,6 +16105,50 @@ def launch_ui():
                 image_engine_check.click(
                     _wrap_gradio_callback(_check_image_engine_ui),
                     image_engine, image_engine_status, show_progress="minimal"
+                )
+
+                gr.Markdown("### 👥 Google Flow Account Pool — hỗ trợ hàng nghìn Account")
+                flow_pool_raw = gr.Textbox(
+                    label="📥 Import Account hàng loạt",
+                    lines=6,
+                    placeholder="Mỗi dòng: account_id\\nhoặc: account_id|profile_path\\nCó thể dán JSON accounts[]",
+                    info="Đây chỉ là đăng ký Pool. Account phải có session Google/Flow thật và được VERIFY mới thành ACTIVE."
+                )
+                with gr.Row():
+                    flow_pool_import = gr.Button("📥 IMPORT POOL", variant="primary")
+                    flow_pool_replace = gr.Checkbox(label="Thay toàn bộ Pool hiện tại", value=False)
+                    flow_pool_refresh = gr.Button("🔄 REFRESH POOL")
+                with gr.Row():
+                    flow_pool_account = gr.Textbox(label="Account ID cần mở/VERIFY", scale=2)
+                    flow_pool_open = gr.Button("🌐 MỞ SESSION", scale=1)
+                    flow_pool_verify = gr.Button("🔌 VERIFY ACCOUNT", scale=1)
+                    flow_pool_verify_open = gr.Button("🔍 VERIFY SESSION ĐANG MỞ", scale=1)
+                flow_pool_status = gr.Markdown(_creative_account_pool_html())
+
+                flow_pool_import.click(
+                    _wrap_gradio_callback(_creative_import_flow_accounts),
+                    [flow_pool_raw, flow_pool_replace],
+                    [flow_pool_status, image_engine_status],
+                    show_progress="minimal"
+                )
+                flow_pool_refresh.click(
+                    _wrap_gradio_callback(lambda: _creative_account_pool_html()),
+                    None, flow_pool_status, show_progress="hidden"
+                )
+                flow_pool_open.click(
+                    _wrap_gradio_callback(_creative_flow_account_open),
+                    flow_pool_account, [flow_pool_status, image_engine_status],
+                    show_progress="minimal"
+                )
+                flow_pool_verify.click(
+                    _wrap_gradio_callback(_creative_flow_account_verify),
+                    flow_pool_account, [flow_pool_status, image_engine_status],
+                    show_progress="minimal"
+                )
+                flow_pool_verify_open.click(
+                    _wrap_gradio_callback(_creative_flow_pool_verify_registered),
+                    None, [flow_pool_status, image_engine_status],
+                    show_progress="minimal"
                 )
 
                 with gr.Row():
