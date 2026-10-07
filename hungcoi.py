@@ -14400,6 +14400,59 @@ def _flow_reconcile_profile_registry():
     return stale
 
 
+def _flow_verified_profiles_report():
+    """Report every durable Flow profile already registered and VERIFIED/ACTIVE.
+    This is read-only: it never creates a profile, opens Chrome, or changes login state.
+    """
+    _flow_reconcile_profile_registry()
+    _flow_account_schema()
+    with _batch_db() as db:
+        rows = db.execute(
+            "SELECT account_id,status,session_health,account_label,session_profile,"
+            "cookie_file,last_success,last_health_check,debug_port "
+            "FROM creative_accounts WHERE provider='GOOGLE_FLOW' "
+            "ORDER BY account_id"
+        ).fetchall()
+
+    verified = []
+    for row in rows:
+        status = str(row["status"] or "").upper()
+        health = str(row["session_health"] or "").upper()
+        profile = str(row["session_profile"] or "").strip()
+        # ACTIVE + HEALTHY is the canonical verified state. Keep ACTIVE rows
+        # visible even if an older DB did not populate session_health.
+        if status == "ACTIVE" and (health in ("", "HEALTHY", "VERIFIED", "OK")):
+            verified.append(row)
+
+    parts = [
+        "<div class='batch-center-card'>",
+        "<b>🔎 FLOW PROFILE CHECK</b>",
+        f"<div>ĐÃ VERIFY / ACTIVE: <b>{len(verified)}</b> · "
+        f"TỔNG ACCOUNT ĐÃ ĐĂNG KÝ: <b>{len(rows)}</b></div>",
+        "<hr><div style='font-family:monospace;font-size:12px;line-height:1.7'>"
+    ]
+    if not verified:
+        parts.append("🟡 Chưa có Profile nào được VERIFY thành công.<br>")
+    else:
+        for row in verified:
+            aid = html.escape(str(row["account_id"] or ""))
+            label = html.escape(str(row["account_label"] or "") or "-")
+            profile = html.escape(str(row["session_profile"] or "") or "-")
+            health = html.escape(str(row["session_health"] or "HEALTHY"))
+            parts.append(
+                f"<b>🟢 {aid}</b> | SESSION={health} | LABEL={label}<br>"
+                f"&nbsp;&nbsp;📁 {profile}<br>"
+            )
+    parts.append("</div></div>")
+    workflow_cmd_log("FLOW_POOL", "VERIFIED_PROFILE_CHECK", verified=len(verified), total=len(rows))
+    return "".join(parts), (
+        f"🟢 Đã kiểm tra Profile: {len(verified)} Profile đã VERIFY/ACTIVE. "
+        "Không tự mở Chrome và không tạo Profile mới."
+        if verified else
+        "🟡 Chưa có Profile nào ở trạng thái VERIFY/ACTIVE."
+    )
+
+
 def _creative_account_pool_html(limit=100):
     """Render a bounded account table; never dump 1000+ rows into the Gradio DOM."""
     _creative_v3_migrate()
@@ -16743,6 +16796,7 @@ def launch_ui():
                     flow_pool_new = gr.Button("➕ MỞ PROFILE MỚI", variant="primary")
                     flow_pool_reopen = gr.Button("🔓 MỞ LẠI PROFILE CŨ", variant="primary")
                     flow_pool_verify = gr.Button("🔌 VERIFY PROFILE", variant="primary")
+                    flow_pool_check = gr.Button("🔎 KIỂM TRA PROFILE ĐÃ VERIFY", variant="secondary")
                     flow_pool_refresh = gr.Button("🔄 REFRESH POOL")
                 flow_pool_account = gr.Textbox(label="Profile ID đang mở", placeholder="FLOW-0001", value="")
                 flow_pool_status = gr.Markdown(_creative_account_pool_html())
@@ -16767,6 +16821,10 @@ def launch_ui():
                     flow_pool_account,
                     [flow_pool_status, flow_pool_hint],
                     show_progress="minimal"
+                )
+                flow_pool_check.click(
+                    _wrap_gradio_callback(_flow_verified_profiles_report),
+                    None, [flow_pool_status, flow_pool_hint], show_progress="minimal"
                 )
                 flow_pool_refresh.click(
                     _wrap_gradio_callback(lambda: _creative_account_pool_html()),
