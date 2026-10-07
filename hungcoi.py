@@ -1519,13 +1519,10 @@ def _creative_health_log(target_type,target_id,status,detail=""):
 
 
 def _creative_session_health(account_id, worker_id=None, force=False):
-    """Ask the real Flow adapter for health. No health claim is made from stale DB state alone."""
+    """Health-check using a Playwright adapter owned by the current thread."""
     _creative_v3_migrate()
     try:
-        global _CREATIVE_FLOW_ADAPTER
-        adapter = _CREATIVE_FLOW_ADAPTER
-        if adapter is None:
-            return False, "Flow adapter chưa khởi tạo."
+        adapter = _flow_thread_adapter()
         result = adapter.health_check(account_id)
         ok = bool(result.get("ok")) if isinstance(result,dict) else bool(result)
         detail = result.get("detail","") if isinstance(result,dict) else str(result)
@@ -13668,28 +13665,87 @@ def _creative_find_scene_contract(project, scene_id, stage):
 
 # ---------- Flow session lifecycle ----------
 
+_FLOW_ADAPTER_LOCAL = threading.local()
+
+def _flow_thread_adapter():
+    """Return a Flow adapter owned by the CURRENT worker/UI executor thread."""
+    adapter = getattr(_FLOW_ADAPTER_LOCAL, "adapter", None)
+    if adapter is None:
+        adapter = GoogleFlowAdapter()
+        _FLOW_ADAPTER_LOCAL.adapter = adapter
+    return adapter
+
 def _flow_context_resilient(self, account_id):
-    """One persistent Playwright context per Flow account; recreate only if dead."""
+    """Attach this thread to the user's existing Chrome Stable profile via CDP.
+
+    Never launch Playwright-managed Chromium. If Chrome was closed, reopen the
+    SAME registered session_profile with the SAME deterministic CDP port.
+    """
+    aid = str(account_id or "").strip()
+    if not aid:
+        raise RuntimeError("Flow Account trống.")
     try:
-        item = self._contexts.get(account_id)
+        item = self._contexts.get(aid)
         if item:
-            pw, browser, page = item
-            alive = True
-            try:
-                alive = bool(browser.is_connected()) and not page.is_closed()
-            except Exception:
-                alive = False
-            if alive:
+            _pw, browser, page = item
+            if bool(browser.is_connected()) and not page.is_closed():
                 return item
             try: browser.close()
             except Exception: pass
-            try: pw.stop()
+            try: _pw.stop()
             except Exception: pass
-            self._contexts.pop(account_id, None)
+            self._contexts.pop(aid, None)
     except Exception:
-        self._contexts.pop(account_id, None)
-    # Delegate initial creation to the original implementation.
-    return _V7_FLOW_CONTEXT_ORIGINAL(self, account_id)
+        self._contexts.pop(aid, None)
+
+    row = _creative_get_account(aid)
+    if not row:
+        raise RuntimeError(f"Không tìm thấy Flow Account: {aid}")
+    profile = str(row.get("session_profile") or "").strip()
+    if not profile:
+        raise RuntimeError(f"{aid} chưa có session_profile.")
+    profile_path = str(Path(profile).expanduser().resolve())
+    Path(profile_path).mkdir(parents=True, exist_ok=True)
+
+    port = int(row.get("debug_port") or _flow_debug_port(aid))
+    if not _flow_cdp_ready(port, timeout=1.5):
+        _flow_launch_stable_chrome(aid, profile_path, self.FLOW_URL)
+        if not _flow_cdp_ready(port, timeout=15):
+            raise CreativeFlowUnavailable(
+                f"Chrome Stable đã mở lại nhưng CDP chưa sẵn sàng: {aid}"
+            )
+
+    try:
+        from playwright.sync_api import sync_playwright
+    except Exception as exc:
+        raise RuntimeError(f"Thiếu Playwright: {exc}")
+
+    pw = sync_playwright().start()
+    try:
+        browser = pw.chromium.connect_over_cdp(
+            f"http://127.0.0.1:{port}", timeout=15000
+        )
+        contexts = browser.contexts
+        if not contexts:
+            raise RuntimeError(f"Chrome CDP không có BrowserContext: {aid}")
+        context = contexts[0]
+        pages = context.pages
+        page = pages[0] if pages else context.new_page()
+        try:
+            if "labs.google" not in str(page.url or "").lower():
+                page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+        self._contexts[aid] = (pw, browser, page)
+        workflow_cmd_log(
+            "FLOW_POOL", "SESSION_CDP_ATTACHED",
+            account_id=aid, profile=profile_path, port=port
+        )
+        return self._contexts[aid]
+    except Exception:
+        try: pw.stop()
+        except Exception: pass
+        raise
 
 _V7_FLOW_CONTEXT_ORIGINAL = GoogleFlowAdapter._context
 GoogleFlowAdapter._context = _flow_context_resilient
@@ -14042,11 +14098,9 @@ def _creative_dispatch_worker_v7(worker_id, job):
 
             if stage == "IMAGE":
                 requested = str(job.get("requested_engine") or CREATIVE_ENGINE_AUTO).upper()
-                force_z = requested == CREATIVE_ENGINE_AUTO and bool(job.get("fallback_reason")) and "Z Image" in str(job.get("fallback_reason"))
-                if force_z:
-                    engine, reason = CREATIVE_ENGINE_ZIMAGE, "Fallback Z Image đã được ghi trong Job."
-                else:
-                    engine, reason = _creative_choose_engine_for_worker(requested)
+                # The UI selection is authoritative. Never resurrect a stale
+                # fallback_reason from an older job and route a Flow selection to Z Image.
+                engine, reason = _creative_choose_engine_for_worker(requested)
                 if not engine:
                     _creative_wait_for_account(job["job_id"], worker_id, reason or "NO_ENGINE")
                     return
@@ -14059,10 +14113,10 @@ def _creative_dispatch_worker_v7(worker_id, job):
                         else:
                             _creative_release_worker(worker_id, "IDLE", detail)
                         return
-                    global _CREATIVE_FLOW_ADAPTER
-                    if _CREATIVE_FLOW_ADAPTER is None:
-                        _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
-                    adapter = _CREATIVE_FLOW_ADAPTER
+                    # Keep Sync Playwright strictly inside this worker thread.
+                    # A thread-local adapter prevents a Playwright object created by
+                    # the UI executor from being reused by another worker thread.
+                    adapter = _flow_thread_adapter()
                 else:
                     adapter = _CREATIVE_ZIMAGE_ADAPTER
                 contract = adapter.run(dict(job), worker_id, account_id)
@@ -14578,7 +14632,7 @@ def _creative_import_flow_accounts(raw_text, replace=False):
 
 
 def _creative_flow_account_open(account_id):
-    """Open/re-open one existing Flow profile without creating a new account."""
+    """Open/re-open the SAME registered Flow profile; UI path uses no Playwright API."""
     aid = str(account_id or "").strip()
     if not aid:
         return _creative_account_pool_html(), "🔴 Chưa chọn Account."
@@ -14586,19 +14640,20 @@ def _creative_flow_account_open(account_id):
     if not row:
         return _creative_account_pool_html(), f"🔴 Không tìm thấy Account: {aid}"
     try:
-        global _CREATIVE_FLOW_ADAPTER
-        if _CREATIVE_FLOW_ADAPTER is None:
-            _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
         profile = str(row.get("session_profile") or "").strip()
         if not profile:
             raise RuntimeError(f"{aid} chưa có session_profile.")
-        # _context() now reopens the SAME profile with installed Chrome Stable
-        # when the previous Chrome window was closed.
-        _CREATIVE_FLOW_ADAPTER._context(aid)
-        workflow_cmd_log("FLOW_POOL", "SESSION_OPEN_OR_REOPEN", account_id=aid, profile=profile)
+        p = Path(profile).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        port = int(row.get("debug_port") or _flow_debug_port(aid))
+        if not _flow_cdp_ready(port, timeout=1.0):
+            _flow_launch_stable_chrome(aid, str(p), GoogleFlowAdapter.FLOW_URL)
+            if not _flow_cdp_ready(port, timeout=15):
+                raise RuntimeError(f"Chrome Stable đã mở nhưng CDP chưa sẵn sàng: {aid}")
+        workflow_cmd_log("FLOW_POOL", "SESSION_OPEN_OR_REOPEN", account_id=aid, profile=str(p), port=port)
         return _creative_account_pool_html(), (
-            f"🟡 Đã mở/re-open session {aid} · dùng đúng Profile cũ.\n"
-            "Đăng nhập Google/Flow hoặc xử lý CAPTCHA thủ công, sau đó bấm VERIFY Account."
+            f"🟡 Đã mở/re-open {aid} bằng đúng Profile cũ.\n"
+            "Đăng nhập Google/Flow hoặc xử lý CAPTCHA thủ công, sau đó bấm VERIFY PROFILE."
         )
     except Exception as exc:
         _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
