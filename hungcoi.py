@@ -14359,9 +14359,51 @@ def _creative_account_pool_summary():
     }
 
 
+def _flow_reconcile_profile_registry():
+    """Remove only clearly stale Flow DB rows whose registered profile is gone.
+    Durable profile folders remain the source of truth for session persistence.
+    Never create a new account or delete a live CDP session here.
+    """
+    _flow_account_schema()
+    global _CREATIVE_FLOW_ADAPTER
+    stale = []
+    with _batch_db() as db:
+        rows = db.execute(
+            "SELECT account_id,session_profile FROM creative_accounts "
+            "WHERE provider='GOOGLE_FLOW' AND account_id LIKE 'FLOW-%'"
+        ).fetchall()
+        for row in rows:
+            aid = str(row["account_id"] or "").strip()
+            profile = str(row["session_profile"] or "").strip()
+            if not aid or not profile:
+                continue
+            try:
+                live = False
+                if _CREATIVE_FLOW_ADAPTER is not None:
+                    item = _CREATIVE_FLOW_ADAPTER._contexts.get(aid)
+                    if item:
+                        _pw, browser, page = item
+                        live = bool(browser.is_connected()) and not page.is_closed()
+                if not live and not Path(profile).expanduser().exists():
+                    stale.append(aid)
+            except Exception:
+                continue
+        if stale:
+            placeholders = ",".join("?" for _ in stale)
+            db.execute(
+                f"DELETE FROM creative_accounts WHERE provider='GOOGLE_FLOW' "
+                f"AND account_id IN ({placeholders})",
+                stale,
+            )
+    if stale:
+        workflow_cmd_log("FLOW_POOL", "STALE_PROFILES_RECONCILED", removed=len(stale), accounts=",".join(stale))
+    return stale
+
+
 def _creative_account_pool_html(limit=100):
     """Render a bounded account table; never dump 1000+ rows into the Gradio DOM."""
     _creative_v3_migrate()
+    _flow_reconcile_profile_registry()
     summary = _creative_account_pool_summary()
     limit = max(10, min(int(limit or 100), 500))
     with _batch_db() as db:
@@ -16699,18 +16741,25 @@ def launch_ui():
                 )
                 with gr.Row():
                     flow_pool_new = gr.Button("➕ MỞ PROFILE MỚI", variant="primary")
+                    flow_pool_reopen = gr.Button("🔓 MỞ LẠI PROFILE CŨ", variant="primary")
                     flow_pool_verify = gr.Button("🔌 VERIFY PROFILE", variant="primary")
                     flow_pool_refresh = gr.Button("🔄 REFRESH POOL")
                 flow_pool_account = gr.Textbox(label="Profile ID đang mở", placeholder="FLOW-0001", value="")
                 flow_pool_status = gr.Markdown(_creative_account_pool_html())
                 flow_pool_hint = gr.Markdown(
-                    "🟡 Quy trình: MỞ PROFILE MỚI → tự đăng nhập Google/Flow → VERIFY PROFILE → "
-                    "tool tự lưu Account + cookie/session vào thư mục tool."
+                    "🟡 Lần đầu: MỞ PROFILE MỚI → đăng nhập Google/Flow → VERIFY. "
+                    "Lần sau: chọn FLOW-xxxx → MỞ LẠI PROFILE CŨ; tool dùng đúng thư mục profile đã lưu, không tạo account mới."
                 )
                 flow_pool_new.click(
                     _wrap_gradio_callback(_creative_flow_manual_profile_open),
                     flow_pool_profile_path,
                     [flow_pool_status, flow_pool_hint, flow_pool_account],
+                    show_progress="minimal"
+                )
+                flow_pool_reopen.click(
+                    _wrap_gradio_callback(_creative_flow_account_open),
+                    flow_pool_account,
+                    [flow_pool_status, flow_pool_hint],
                     show_progress="minimal"
                 )
                 flow_pool_verify.click(
