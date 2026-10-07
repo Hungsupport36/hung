@@ -1895,14 +1895,28 @@ def _creative_timeline(project):
 # ============================================================
 
 def _creative_master_full(project,scenes,requested_engine=CREATIVE_ENGINE_AUTO,start=True):
-    """Master Full creates durable jobs and starts the common scheduler only.
-    It never calls Flow/Z Image/Depth/Motion linearly.
+    """Master Full creates durable jobs, starts workers, and immediately kicks the scheduler.
+    The immediate dispatch prevents a race where the UI waits after JOBS_CREATED while
+    the background scheduler has not yet performed its first tick.
     """
     project=_batch_project_name(project)
     manifest=_creative_prepare_project(project,scenes,requested_engine)
     _creative_set_control(project,"RUNNING","MASTER FULL")
     if start:
-        _creative_start_workers(project,int(os.getenv("VHUNG_CREATIVE_FLOW_WORKERS","2") or 2),"FLOW")
+        count=int(os.getenv("VHUNG_CREATIVE_FLOW_WORKERS","2") or 2)
+        _creative_start_workers(project,count,"FLOW")
+        try:
+            dispatched=_creative_scheduler_dispatch(project)
+            workflow_cmd_log(
+                "CREATIVE","SCHEDULER_KICK",
+                project=project,workers=count,dispatched=bool(dispatched)
+            )
+        except Exception as exc:
+            workflow_cmd_log(
+                "CREATIVE","SCHEDULER_KICK_ERROR",
+                project=project,detail=str(exc)[:1200],level="ERROR"
+            )
+            raise
     return manifest
 
 
