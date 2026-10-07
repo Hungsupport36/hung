@@ -4746,7 +4746,212 @@ def launch_ui():
           }, true);
         }""")
 
-        with gr.Tabs(elem_id='main-workflow-tabs') as main_tabs:
+        
+# ============================================================
+# CREATIVE STUDIO UI + IMAGE-ONLY MASTER CHAIN
+# ============================================================
+CREATIVE_IMAGE_ONLY_STAGES = ("IMAGE", "POSTPROCESS", "CLEAN_MAX_VIP", "QC")
+CREATIVE_STUDIO_VERSION = "V11.6.2"
+
+def _creative_image_engine_ui_value(value=None):
+    value = str(value or _selected_image_engine() or CREATIVE_ENGINE_FLOW).upper().strip()
+    return value if value in (CREATIVE_ENGINE_FLOW, CREATIVE_ENGINE_ZIMAGE) else CREATIVE_ENGINE_FLOW
+
+def _creative_master_full(project, scenes, requested_engine=None, start=True):
+    """Canonical image-only Master: IMAGE -> POSTPROCESS -> CLEAN -> QC."""
+    project = _batch_project_name(project)
+    engine = _creative_image_engine_ui_value(requested_engine)
+    now = _creative_now()
+    _creative_db_init()
+    with _batch_db() as db:
+        for scene in scenes or []:
+            sid = str(scene.get("scene_id") or "").strip()
+            if not sid or scene_media_type(scene, "image") != "image":
+                continue
+            for stage in CREATIVE_IMAGE_ONLY_STAGES:
+                deps = [] if stage == "IMAGE" else (
+                    ["IMAGE"] if stage == "POSTPROCESS" else
+                    ["POSTPROCESS"] if stage == "CLEAN_MAX_VIP" else
+                    ["CLEAN_MAX_VIP"]
+                )
+                jid = _creative_job_id(project, sid, stage)
+                db.execute(
+                    """INSERT INTO creative_jobs(
+                        job_id,project_id,scene_id,stage,status,priority,max_retry,ready_at,
+                        requested_engine,dependency_json,created_at,updated_at,control_state
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(project_id,scene_id,stage) DO UPDATE SET
+                        requested_engine=excluded.requested_engine,
+                        dependency_json=excluded.dependency_json,
+                        updated_at=excluded.updated_at,
+                        control_state='RUN'
+                    """,
+                    (jid, project, sid, stage, "PENDING",
+                     _creative_priority("NORMAL"), CREATIVE_MAX_RETRY, now,
+                     engine, _creative_json(deps), now, now, "RUN"),
+                )
+    if start:
+        _creative_set_control(project, "RUNNING", "Creative Studio Master")
+        _creative_start_workers(project, count=1, worker_type="FLOW" if engine == CREATIVE_ENGINE_FLOW else "Z_IMAGE")
+        _creative_reconcile_dependencies(project)
+        _creative_start_scheduler(project)
+    return True
+
+def _creative_studio_queue_html(project=""):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    if not project:
+        return "<div class='creative-empty'>Chưa chọn Project.</div>"
+    _creative_db_init()
+    with _batch_db() as db:
+        rows = db.execute(
+            """SELECT scene_id,stage,status,retry_count,actual_engine,error,worker_id,account_id
+               FROM creative_jobs WHERE project_id=?
+               ORDER BY CAST(REPLACE(scene_id,'Scene_','') AS INTEGER),stage""",
+            (project,),
+        ).fetchall()
+    if not rows:
+        return "<div class='creative-empty'>Chưa có Job. Bấm TẠO / CHẠY để khởi tạo.</div>"
+    icons = {"DONE":"🟢","RUNNING":"🔵","READY":"🟡","PENDING":"⚪",
+             "WAITING_DEPENDENCY":"⏳","RETRY":"🟠","FAILED":"🔴",
+             "CAPTCHA":"🟥","SKIPPED":"⏭️"}
+    html_rows = []
+    for r in rows:
+        status = str(r["status"] or "")
+        err = str(r["error"] or "")
+        html_rows.append(
+            "<tr>"
+            f"<td>{html.escape(str(r['scene_id'] or ''))}</td>"
+            f"<td>{html.escape(str(r['stage'] or ''))}</td>"
+            f"<td>{icons.get(status,'⚪')} {html.escape(status)}</td>"
+            f"<td>{html.escape(str(r['actual_engine'] or r['account_id'] or ''))}</td>"
+            f"<td>{html.escape(str(r['retry_count'] or 0))}</td>"
+            f"<td>{html.escape(str(r['worker_id'] or ''))}</td>"
+            f"<td title='{html.escape(err)}'>{html.escape(err[:160])}</td>"
+            "</tr>"
+        )
+    return (
+        "<div class='creative-queue-wrap'><table class='creative-queue'>"
+        "<thead><tr><th>Scene</th><th>Stage</th><th>Status</th><th>Engine/Account</th>"
+        "<th>Retry</th><th>Worker</th><th>Error</th></tr></thead>"
+        "<tbody>" + "".join(html_rows) + "</tbody></table></div>"
+    )
+
+def _creative_studio_status_ui(project=""):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    if not project:
+        return "⚪ Chưa có Project."
+    with _batch_db() as db:
+        rows = db.execute(
+            "SELECT status,COUNT(*) n FROM creative_jobs WHERE project_id=? GROUP BY status",
+            (project,),
+        ).fetchall()
+    counts = {str(r["status"]): int(r["n"]) for r in rows}
+    return (
+        f"**{project}** · 🟢 DONE {counts.get('DONE',0)} · "
+        f"🔵 RUN {counts.get('RUNNING',0)} · 🟠 RETRY {counts.get('RETRY',0)} · "
+        f"🔴 FAIL {counts.get('FAILED',0)} · 🟥 CAPTCHA {counts.get('CAPTCHA',0)}"
+    )
+
+def _creative_studio_create_run_ui(project, engine):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    if not project:
+        return "🔴 Chưa chọn Project.", _creative_studio_queue_html("")
+    scenes = load_manifest(project)
+    if not scenes:
+        return "🔴 Project chưa có Scene/manifest.", _creative_studio_queue_html(project)
+    engine = _creative_image_engine_ui_value(engine)
+    if engine == CREATIVE_ENGINE_FLOW and not _creative_engine_available(CREATIVE_ENGINE_FLOW):
+        return "🔴 Google Flow chưa CONNECTED/ACTIVE. Hãy VERIFY Profile trước.", _creative_studio_queue_html(project)
+    try:
+        _creative_master_full(project, scenes, engine, start=True)
+        workflow_cmd_log("CREATIVE_STUDIO", "MASTER_STARTED", project=project, scenes=len(scenes), engine=engine)
+        return f"🟢 Đã đưa {len(scenes)} Scene vào queue · Engine={engine}", _creative_studio_queue_html(project)
+    except Exception as exc:
+        return f"🔴 Không khởi tạo Creative Studio: {str(exc)[:1200]}", _creative_studio_queue_html(project)
+
+def _creative_studio_refresh_ui(project):
+    return _creative_studio_status_ui(project), _creative_studio_queue_html(project)
+
+def _creative_studio_pause_ui(project):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    if not project: return "🔴 Chưa chọn Project."
+    _creative_set_control(project, "PAUSED", "Creative Studio PAUSE")
+    return "⏸ Đã PAUSE queue."
+
+def _creative_studio_resume_ui(project):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    if not project: return "🔴 Chưa chọn Project."
+    _creative_resume(project)
+    return "▶️ Đã RESUME queue."
+
+def _creative_studio_stop_ui(project):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    if not project: return "🔴 Chưa chọn Project."
+    _creative_stop(project)
+    return "⏹ Đã STOP queue của Project này."
+
+def _creative_studio_depth_ui(project):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    scenes = load_manifest(project)
+    if not scenes: return "🔴 Không có Scene."
+    try:
+        from PIL import Image, ImageOps
+        out_dir = _project_image_dir(project_dir(project)) / "Depth"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        done = 0
+        for sc in scenes:
+            sid = str(sc.get("scene_id") or "").strip()
+            src = _creative_find_existing_scene_output(project, sid)
+            if not src: continue
+            out = out_dir / f"{sid}_depth.png"
+            with Image.open(src) as im:
+                im = ImageOps.autocontrast(im.convert("L").resize(
+                    (CREATIVE_IMAGE_WIDTH, CREATIVE_IMAGE_HEIGHT), Image.Resampling.LANCZOS
+                ))
+                im.save(out, "PNG", optimize=True)
+            done += 1
+        return f"🌀 Depth batch hoàn tất: {done}/{len(scenes)} Scene → Hình ảnh/Depth/"
+    except Exception as exc:
+        return f"🔴 Depth batch lỗi: {exc}"
+
+def _creative_studio_motion_ui(project):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    scenes = load_manifest(project)
+    if not scenes: return "🔴 Không có Scene."
+    out_dir = _project_image_dir(project_dir(project)) / "MotionControl"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    done = 0
+    for sc in scenes:
+        sid = str(sc.get("scene_id") or "").strip()
+        if not sid: continue
+        write_json(out_dir / f"{sid}.json", {
+            "scene_id": sid, "type": "motion_control",
+            "source_image": str(_creative_find_existing_scene_output(project, sid) or ""),
+            "depth": str(out_dir.parent / "Depth" / f"{sid}_depth.png"),
+            "camera": {"pan_x":0.0,"pan_y":0.0,"zoom":0.0,"rotation":0.0},
+            "generated_at": _creative_now(),
+        })
+        done += 1
+    return f"🎛 Motion Control batch hoàn tất: {done}/{len(scenes)} Scene → Hình ảnh/MotionControl/"
+
+def _creative_studio_timeline_ui(project):
+    project = _batch_project_name(project or SETTINGS.get("selected_project", ""))
+    scenes = load_manifest(project)
+    if not scenes: return "🔴 Không có Scene."
+    out = project_dir(project) / "Dòng thời gian" / "creative_timeline.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    items=[]; t=0.0
+    for sc in scenes:
+        sid=str(sc.get("scene_id") or "").strip()
+        if not sid: continue
+        try: dur=float(sc.get("duration") or 0)
+        except Exception: dur=0.0
+        items.append({"scene_id":sid,"start":t,"duration":dur,"end":t+dur}); t+=dur
+    write_json(out, {"project":project,"fps":30,"duration":t,"scenes":items,"generated_at":_creative_now()})
+    return f"🧭 Timeline đã tạo: {out}"
+
+
+with gr.Tabs(elem_id='main-workflow-tabs') as main_tabs:
             # UI SOURCE OF TRUTH: top-level Gradio tabs; Độc Lập is the dedicated standalone workspace. Every direct child of gr.Tabs MUST be gr.Tab/gr.TabItem.
             # =================================================
             # VOICE
