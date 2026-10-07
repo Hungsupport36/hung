@@ -170,7 +170,40 @@ jobs:
               lines[end:end] = ["\n"] + wrapper_lines
 
           s = "".join(lines)
-          # Patch the health-failure demotion in _creative_claim_account_checked_v1161.\n          # The source is large, so patch the stable two-line marker instead of replacing the file.\n          if "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY" not in s:\n              marker = "        detail = str(detail or \\\"\\\")\\n        now = _creative_now()"\n              guard = textwrap.dedent(r'''\n              detail = str(detail or "")\n              now = _creative_now()\n              try:\n                  with _batch_db() as db:\n                      _verified_row = db.execute(\n                          "SELECT last_success FROM creative_accounts WHERE account_id=? LIMIT 1",\n                          (account_id,),\n                      ).fetchone()\n                  _verified_at = str(_verified_row[0] or "") if _verified_row else ""\n                  if _verified_at:\n                      _dt = datetime.fromisoformat(_verified_at.replace("Z", "+00:00"))\n                      _age = (datetime.now(timezone.utc) - _dt).total_seconds()\n                      if 0 <= _age <= 900:\n                          workflow_cmd_log(\n                              "FLOW",\n                              "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY",\n                              account_id=account_id,\n                              age_seconds=round(_age, 1),\n                              detail=detail[:500],\n                              level="DEBUG",\n                          )\n                          return account_id, "OK"\n              except Exception:\n                  pass\n              ''').strip("\\n")\n              if marker not in s:\n                  raise SystemExit("V11.6.3 health-failure marker not found")\n              s = s.replace(marker, guard, 1)\n\n          ast.parse(s, filename="hungcoi.py")
+          # Patch the health-failure demotion in _creative_claim_account_checked_v1161.
+          # A recent successful browser Verify is stronger than a transient health probe.
+          if "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY" not in s:
+              marker = '        detail = str(detail or "")\\n        now = _creative_now()'
+              guard = textwrap.dedent(r'''
+              detail = str(detail or "")
+              now = _creative_now()
+              try:
+                  with _batch_db() as db:
+                      _verified_row = db.execute(
+                          "SELECT last_success FROM creative_accounts WHERE account_id=? LIMIT 1",
+                          (account_id,),
+                      ).fetchone()
+                  _verified_at = str(_verified_row[0] or "") if _verified_row else ""
+                  if _verified_at:
+                      _dt = datetime.fromisoformat(_verified_at.replace("Z", "+00:00"))
+                      _age = (datetime.now(timezone.utc) - _dt).total_seconds()
+                      if 0 <= _age <= 900:
+                          workflow_cmd_log(
+                              "FLOW",
+                              "PROFILE_HEALTH_SOFT_PASS_AFTER_VERIFY",
+                              account_id=account_id,
+                              age_seconds=round(_age, 1),
+                              detail=detail[:500],
+                              level="DEBUG",
+                          )
+                          return account_id, "OK"
+              except Exception:
+                  pass
+              ''').strip("\n")
+              if marker not in s:
+                  raise SystemExit("V11.6.3 health-failure marker not found")
+              s = s.replace(marker, guard, 1)
+          ast.parse(s, filename="hungcoi.py")
           p.write_text(s, encoding="utf-8")
           print("V11.6.2 verified-profile activation patch syntax OK")
 
