@@ -14155,46 +14155,52 @@ GoogleFlowAdapter.run = _flow_run_v7
 # ---------- Account claim: no-account is WAITING, not AUTH_ERROR ----------
 
 def _creative_claim_account_checked_v7(worker_id, job_id, provider=CREATIVE_ENGINE_FLOW):
+    """Claim a real Flow account, auto-activating an already authenticated profile."""
     _creative_refresh_cooldowns()
     account_id = _creative_atomic_claim_account(worker_id, job_id, provider)
-    if not account_id:
-        return None, "NO_ACTIVE_ACCOUNT"
-    ok, detail = _creative_session_health(account_id, worker_id, force=True)
-    if not ok:
-        detail = str(detail or "")
-        now = _creative_now()
+    if account_id:
+        return account_id, "OK"
+
+    _creative_db_init()
+    candidates=[]
+    now=_creative_now()
+    try:
         with _batch_db() as db:
-            if "CAPTCHA" in detail.upper() or "UNUSUAL" in detail.upper():
-                db.execute(
-                    "UPDATE creative_accounts SET status='CAPTCHA',last_error=?,updated_at=? WHERE account_id=?",
-                    (detail[:1500], now, account_id),
-                )
-                db.execute(
-                    "UPDATE creative_jobs SET status='CAPTCHA',error_class='CAPTCHA',"
-                    "error=?,worker_id=NULL,account_id=?,updated_at=? "
-                    "WHERE job_id=? AND status='RUNNING'",
-                    (detail[:1500], account_id, now, job_id),
-                )
-            else:
-                db.execute(
-                    "UPDATE creative_accounts SET status='AUTH_ERROR',last_error=?,updated_at=? WHERE account_id=?",
-                    (detail[:1500], now, account_id),
-                )
-                db.execute(
-                    "UPDATE creative_jobs SET status='RETRY',error_class='AUTH_ERROR',"
-                    "error=?,worker_id=NULL,account_id=NULL,ready_at=?,updated_at=? "
-                    "WHERE job_id=? AND status='RUNNING'",
-                    (detail[:1500], now, now, job_id),
-                )
+            rows=db.execute(
+                "SELECT account_id,status FROM creative_accounts "
+                "WHERE provider=? AND status IN ('AUTH_ERROR','DISABLED','COOLDOWN') "
+                "AND (cooldown_until IS NULL OR cooldown_until<=?) ORDER BY updated_at",
+                (provider,now),
+            ).fetchall()
+            candidates=[str(row["account_id"]) for row in rows]
+    except Exception:
+        candidates=[]
+
+    for aid in candidates:
+        try:
+            ok,detail=_creative_session_health(aid,worker_id,force=True)
+        except Exception as exc:
+            ok,detail=False,str(exc)
+        if not ok:
+            continue
+        with _batch_db() as db:
             db.execute(
-                "UPDATE creative_workers SET status='IDLE',job_id=NULL,account_id=NULL,updated_at=? WHERE worker_id=?",
-                (now, worker_id),
+                "UPDATE creative_accounts SET status='ACTIVE',session_health='HEALTHY',"
+                "last_success=?,last_error=NULL,cooldown_until=NULL,updated_at=? "
+                "WHERE account_id=? AND provider=?",
+                (now,now,aid,provider),
             )
-        return None, detail
-    return account_id, "OK"
+        workflow_cmd_log(
+            "FLOW_POOL","AUTO_VERIFY_ACTIVE",account_id=aid,
+            detail="Chrome/CDP session HEALTHY; tự ACTIVE trước khi claim job.",
+        )
+        account_id=_creative_atomic_claim_account(worker_id,job_id,provider)
+        if account_id:
+            return account_id,"OK"
+
+    return None,"NO_ACTIVE_ACCOUNT"
 
 _creative_claim_account_checked = _creative_claim_account_checked_v7
-
 # ---------- Real image postprocess / Clean MAX VIP / QC ----------
 
 def _creative_image_input_path(job):
