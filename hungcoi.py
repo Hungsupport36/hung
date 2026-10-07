@@ -14557,6 +14557,8 @@ def _flow_account_schema():
             db.execute("ALTER TABLE creative_accounts ADD COLUMN account_label TEXT")
         if "cookie_file" not in cols:
             db.execute("ALTER TABLE creative_accounts ADD COLUMN cookie_file TEXT")
+        if "debug_port" not in cols:
+            db.execute("ALTER TABLE creative_accounts ADD COLUMN debug_port INTEGER")
 
 def _flow_next_profile_id():
     _flow_account_schema()
@@ -14598,6 +14600,64 @@ def _flow_persist_storage_state(account_id, browser=None, page=None):
     except Exception as exc:
         return False, str(exc)
 
+def _flow_debug_port(account_id):
+    """Stable private CDP port per tool-owned Flow profile."""
+    n = int(hashlib.sha256(str(account_id).encode("utf-8")).hexdigest()[:8], 16)
+    return 20000 + (n % 18000)
+
+def _flow_chrome_executable():
+    candidates = [
+        Path(os.environ.get("PROGRAMFILES", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("PROGRAMFILES(X86)", "")) / "Google/Chrome/Application/chrome.exe",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Google/Chrome/Application/chrome.exe",
+    ]
+    for p in candidates:
+        if p.exists():
+            return p
+    return None
+
+def _flow_launch_stable_chrome(account_id, profile, url):
+    """Launch real installed Chrome with a tool-owned profile; never Chrome Testing."""
+    exe = _flow_chrome_executable()
+    if not exe:
+        raise RuntimeError("Không tìm thấy Google Chrome Stable. Tool không cài Chrome Testing.")
+    port = _flow_debug_port(account_id)
+    # Chrome 136+ requires remote debugging to target a non-default user-data-dir.
+    Path(profile).mkdir(parents=True, exist_ok=True)
+    args = [
+        str(exe),
+        f"--user-data-dir={str(Path(profile).resolve())}",
+        f"--remote-debugging-port={port}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--new-window",
+        str(url),
+    ]
+    flags = 0
+    if os.name == "nt":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    proc = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            creationflags=flags)
+    with _batch_db() as db:
+        db.execute("UPDATE creative_accounts SET debug_port=?,updated_at=? WHERE account_id=?",
+                   (port, _creative_now(), account_id))
+    workflow_cmd_log("FLOW_POOL", "CHROME_STABLE_LAUNCHED", account_id=account_id, port=port, pid=proc.pid)
+    return port, proc.pid
+
+def _flow_cdp_ready(port, timeout=8):
+    deadline = time.monotonic() + float(timeout)
+    url = f"http://127.0.0.1:{int(port)}/json/version"
+    while time.monotonic() < deadline:
+        try:
+            r = requests.get(url, timeout=0.6)
+            if r.ok:
+                return True
+        except Exception:
+            pass
+        time.sleep(0.2)
+    return False
+
 def _flow_create_manual_profile(profile_path=""):
     """Create/register a profile; user performs Google/Flow login manually."""
     _flow_account_schema()
@@ -14606,10 +14666,11 @@ def _flow_create_manual_profile(profile_path=""):
     p.mkdir(parents=True, exist_ok=True)
     now = _creative_now()
     with _batch_db() as db:
+        port = _flow_debug_port(aid)
         db.execute(
-            "INSERT INTO creative_accounts(account_id,provider,status,session_profile,account_label,cookie_file,created_at,updated_at) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (aid, "GOOGLE_FLOW", "DISABLED", str(p), "", str(_flow_storage_paths(aid)[1]), now, now)
+            "INSERT INTO creative_accounts(account_id,provider,status,session_profile,account_label,cookie_file,debug_port,created_at,updated_at) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (aid, "GOOGLE_FLOW", "DISABLED", str(p), "", str(_flow_storage_paths(aid)[1]), port, now, now)
         )
     workflow_cmd_log("FLOW_POOL", "PROFILE_REGISTERED", account_id=aid, profile=str(p))
     return aid, str(p)
@@ -14623,11 +14684,11 @@ def _creative_flow_manual_profile_open(profile_path=""):
         aid, profile = _flow_create_manual_profile(profile_path)
         def _open_worker():
             try:
-                global _CREATIVE_FLOW_ADAPTER
-                if _CREATIVE_FLOW_ADAPTER is None:
-                    _CREATIVE_FLOW_ADAPTER = GoogleFlowAdapter()
-                _CREATIVE_FLOW_ADAPTER._context(aid)
-                workflow_cmd_log("FLOW_POOL", "PROFILE_BROWSER_READY", account_id=aid, profile=profile)
+                port, pid = _flow_launch_stable_chrome(aid, profile, GoogleFlowAdapter.FLOW_URL)
+                if _flow_cdp_ready(port):
+                    workflow_cmd_log("FLOW_POOL", "PROFILE_BROWSER_READY", account_id=aid, profile=profile, port=port, pid=pid)
+                else:
+                    _creative_set_account_state(aid, "AUTH_ERROR", "Chrome đã mở nhưng CDP chưa sẵn sàng.")
             except Exception as exc:
                 _creative_set_account_state(aid, "AUTH_ERROR", str(exc)[:1500])
                 workflow_cmd_log("FLOW_POOL", "PROFILE_BROWSER_ERROR", account_id=aid, detail=str(exc)[:1000], level="ERROR")
@@ -14690,7 +14751,7 @@ def _creative_account_pool_html(limit=100):
     limit = max(10, min(int(limit or 100), 500))
     with _batch_db() as db:
         rows = db.execute(
-            "SELECT account_id,status,usage,quota,session_health,account_label,session_profile "
+            "SELECT account_id,status,usage,quota,session_health,account_label,session_profile,debug_port "
             "FROM creative_accounts WHERE provider='GOOGLE_FLOW' ORDER BY account_id LIMIT ?", (limit,)
         ).fetchall()
     parts = [
@@ -14770,8 +14831,6 @@ def _playwright_chrome_runtime_check():
 def _playwright_install_worker():
     global _PLAYWRIGHT_INSTALL_RUNNING, _PLAYWRIGHT_INSTALL_MESSAGE
     with _PLAYWRIGHT_INSTALL_LOCK:
-        if _PLAYWRIGHT_INSTALL_RUNNING:
-            return
         _PLAYWRIGHT_INSTALL_RUNNING = True
         _PLAYWRIGHT_INSTALL_MESSAGE = "🟡 Đang cài/sửa Python Playwright ở nền..."
     try:
@@ -14836,26 +14895,38 @@ def _flow_context_registered_profile(self, account_id):
                 return item
     except Exception:
         pass
-    # IMPORTANT: use the user's installed stable Google Chrome, NOT Playwright's
-    # "Chrome for Testing" / bundled Chromium. This keeps Flow sessions in a
-    # normal browser runtime while the persistent profile remains tool-owned.
     ok, detail = _playwright_chrome_runtime_check()
     if not ok:
         raise RuntimeError(detail)
     from playwright.sync_api import sync_playwright
-    p = Path(profile).expanduser().resolve()
-    p.mkdir(parents=True, exist_ok=True)
+    port = int((row or {}).get("debug_port") or _flow_debug_port(account_id))
+    if not _flow_cdp_ready(port, timeout=3):
+        # Existing V10/manual profiles may not have a running Chrome yet.
+        p = Path(profile).expanduser().resolve()
+        p.mkdir(parents=True, exist_ok=True)
+        pw = sync_playwright().start()
+        browser = pw.chromium.launch_persistent_context(
+            str(p), headless=False, channel="chrome",
+            args=["--disable-background-networking"],
+        )
+        page = browser.pages[0] if browser.pages else browser.new_page()
+        page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+        return pw, browser, page
+    # Connect to the already-running stable Chrome instance in THIS thread.
+    # Do not reuse Playwright objects created by another thread.
     pw = sync_playwright().start()
-    browser = pw.chromium.launch_persistent_context(
-        str(p),
-        headless=False,
-        channel="chrome",
-        args=["--disable-background-networking"],
-    )
-    page = browser.pages[0] if browser.pages else browser.new_page()
-    page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
-    self._contexts[account_id] = (pw, browser, page)
-    return self._contexts[account_id]
+    browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{port}", timeout=10000)
+    contexts = browser.contexts
+    if not contexts:
+        raise RuntimeError(f"Chrome CDP connected nhưng không có BrowserContext: {account_id}")
+    context = contexts[0]
+    page = context.pages[0] if context.pages else context.new_page()
+    if not page.url or "flow" not in page.url.lower():
+        try:
+            page.goto(self.FLOW_URL, wait_until="domcontentloaded", timeout=60000)
+        except Exception:
+            pass
+    return pw, browser, page
 
 GoogleFlowAdapter._context = _flow_context_registered_profile
 
