@@ -14798,41 +14798,44 @@ _PLAYWRIGHT_INSTALL_RUNNING = False
 _PLAYWRIGHT_INSTALL_MESSAGE = "⚪ Chưa kiểm tra Playwright / Google Chrome."
 
 def _playwright_chrome_runtime_check():
-    """Return (ok, detail) without launching a browser."""
+    """Check Playwright safely even when called from Gradio's asyncio event loop.
+
+    IMPORTANT: Playwright Sync API must never be started in the Gradio asyncio
+    loop thread. The runtime probe therefore runs in a short-lived subprocess.
+    The actual Flow callbacks are already dispatched through _ASYNC_EXECUTOR.
+    """
     try:
         import importlib.util
         if importlib.util.find_spec("playwright") is None:
             return False, "🔴 Thiếu Python package Playwright. Bấm CÀI / SỬA PLAYWRIGHT."
-        from playwright.sync_api import sync_playwright
-        pw = sync_playwright().start()
+
+        probe_code = (
+            "from playwright.sync_api import sync_playwright\n"
+            "pw=sync_playwright().start()\n"
+            "pw.stop()\n"
+            "print('PLAYWRIGHT_SYNC_OK')\n"
+        )
         try:
-            chrome_candidates = []
-            for env_key in ("PROGRAMFILES", "PROGRAMFILES(X86)", "LOCALAPPDATA"):
-                base = os.environ.get(env_key)
-                if base:
-                    chrome_candidates.extend([
-                        Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe",
-                        Path(base) / "Google" / "Chrome" / "Application" / "chrome.exe",
-                    ])
-            chrome = next((p for p in chrome_candidates if p.exists()), None)
-            if chrome is None:
-                # Playwright can resolve the stable Chrome channel itself.
-                # The executable-path probe is intentionally not used here because
-                # it may point at bundled Chromium instead of installed Chrome.
-                try:
-                    probe = pw.chromium.executable_path
-                    bundled = str(probe).lower()
-                    if "chrome-win" in bundled or "chrome for testing" in bundled:
-                        pass
-                except Exception:
-                    pass
-                return False, "🔴 Không tìm thấy Google Chrome Stable. Tool KHÔNG tự cài Chrome Testing."
-            return True, f"🟢 Playwright OK · Google Chrome Stable OK · {chrome}"
-        finally:
-            try:
-                pw.stop()
-            except Exception:
-                pass
+            proc = subprocess.run(
+                [sys.executable, "-c", probe_code],
+                capture_output=True,
+                text=True,
+                timeout=30,
+                creationflags=(subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+            )
+        except subprocess.TimeoutExpired:
+            return False, "🔴 Playwright runtime probe timeout (>30s)."
+
+        if proc.returncode != 0 or "PLAYWRIGHT_SYNC_OK" not in (proc.stdout or ""):
+            err = (proc.stderr or proc.stdout or "unknown error").strip()
+            return False, f"🔴 Playwright runtime lỗi: {err[:700]}"
+
+        chrome = _flow_chrome_executable() if callable(globals().get("_flow_chrome_executable")) else None
+        if chrome is None:
+            # Do not probe/play with Playwright's bundled Chromium/Chrome Testing.
+            return False, "🔴 Không tìm thấy Google Chrome Stable. Tool KHÔNG tự cài Chrome Testing."
+
+        return True, f"🟢 Playwright OK · Google Chrome Stable OK · {chrome}"
     except Exception as exc:
         return False, f"🔴 Playwright runtime lỗi: {str(exc)[:700]}"
 
