@@ -2870,17 +2870,23 @@ def _combine_full_voice_final(project, output_dir="", stop_event=None):
         raise RuntimeError("Gộp Voice Full không trả kết quả.")
     return last
 
-def _master_clean_stage_if_qc_ok(project_name,final_qc_text,zimage_status):
-    status=str(zimage_status or ''); final_text=str(final_qc_text or '').strip()
-    if 'MASTER_ZIMAGE_OK' not in status or not final_text.startswith('✓ FINAL QC PASS'):
-        msg='⛔ CLEAN BỊ KHÓA — chưa có Z-Image-Turbo hoàn tất + Final QC PASS.'; workflow_cmd_log('MASTER','CLEAN_BLOCKED_MASTER_GATE',project=safe_name(project_name or ''),zimage_ok=('MASTER_ZIMAGE_OK' in status),final_qc=bool(final_text)); yield msg,[],_workflow_progress_card(msg,100,'qc'); return
+def _master_clean_stage_if_qc_ok(project_name,final_qc_text,image_status):
+    status=str(image_status or ''); final_text=str(final_qc_text or '').strip()
+    selected_engine=_selected_image_engine()
+    image_gate=('MASTER_IMAGE_OK' in status or
+                (selected_engine == CREATIVE_ENGINE_FLOW and 'MASTER_FLOW_OK' in status) or
+                (selected_engine == CREATIVE_ENGINE_ZIMAGE and 'MASTER_ZIMAGE_OK' in status))
+    if not image_gate or not final_text.startswith('✓ FINAL QC PASS'):
+        msg=f'⛔ CLEAN BỊ KHÓA — {selected_engine} chưa hoàn tất + Final QC PASS.'
+        workflow_cmd_log('MASTER','CLEAN_BLOCKED_MASTER_GATE',project=safe_name(project_name or ''),engine=selected_engine,image_ok=image_gate,final_qc=bool(final_text))
+        yield msg,[],_workflow_progress_card(msg,100,'qc'); return
     state = _load_project_workflow_state(project_name)
     if state.get("clean") == "verified":
         files = _master_gradio_files(_wm_image_files(project_name))
         msg = f"♻ RESUME — CLEAN MAX VIP đã VERIFY trước đó. Bỏ qua làm sạch lại {len(files)} ảnh."
         workflow_cmd_log("MASTER", "RESUME_SKIP_CLEAN", project=project_name, image_count=len(files))
         # Preserve the Z-Image completion gate for the final MASTER callback.
-        yield _clean_max_vip_hud(100, msg), files, msg + "\n\n[MASTER_ZIMAGE_OK]"
+        yield _clean_max_vip_hud(100, msg), files, msg + "\n\n[MASTER_IMAGE_OK]"
         return
     # CLEAN must not erase the upstream Z-Image gate stored in the shared
     # workflow_return_status. Re-attach it to the third output consumed by
@@ -2888,7 +2894,7 @@ def _master_clean_stage_if_qc_ok(project_name,final_qc_text,zimage_status):
     for clean_item in _auto_clean_after_qc_ui(project_name,final_text):
         if isinstance(clean_item,(tuple,list)) and len(clean_item)==3:
             clean_hud, clean_files, clean_msg = clean_item
-            yield clean_hud, clean_files, str(clean_msg or '') + "\n\n[MASTER_ZIMAGE_OK]"
+            yield clean_hud, clean_files, str(clean_msg or '') + "\n\n[MASTER_IMAGE_OK]"
         else:
             yield clean_item
 
@@ -2920,33 +2926,50 @@ def _master_combine_full_voice_ui(project, output_dir=""):
     workflow_cmd_log("VOICE_FULL", "END", project=project)
     return result
 
-def _master_finish_if_qc_ok(zimage_status,final_qc_text,clean_status):
+def _master_finish_if_qc_ok(image_status,final_qc_text,clean_status):
     global MASTER_RUNNING
-    zimage_status_text = str(zimage_status or '')
-    # CLEAN dùng chung workflow_return_status với Z-Image. Trước đây CLEAN
-    # ghi đè status này nên marker MASTER_ZIMAGE_OK bị mất dù ảnh đã VERIFY đủ.
-    # Nguồn sự thật cuối cùng vẫn là các file ảnh đã VERIFY.
-    zimage_ok='MASTER_ZIMAGE_OK' in zimage_status_text
-    if not zimage_ok:
-        try:
-            project_check=safe_name(str(SETTINGS.get('selected_project','') or ''))
-            if project_check:
-                verify_ok, verify_files, verify_missing, verify_bad = _verify_zimage_project_images(project_check)
-                expected_images=[s for s in load_manifest(project_check) if scene_media_type(s,'image') == 'image']
-                zimage_ok=bool(verify_ok and len(verify_files) >= len(expected_images))
-                if zimage_ok:
-                    workflow_cmd_log('MASTER','ZIMAGE_FINISH_GATE_RECOVERED_FROM_FILES',project=project_check,verified=len(verify_files),expected=len(expected_images))
-        except Exception as exc:
-            workflow_cmd_log('MASTER','ZIMAGE_FINISH_GATE_VERIFY_WARNING',error=str(exc)[:500],level='WARN')
+    image_status_text=str(image_status or '')
+    selected_engine=_selected_image_engine()
+    image_ok=False
+    if selected_engine == CREATIVE_ENGINE_FLOW:
+        image_ok='MASTER_IMAGE_OK' in image_status_text or 'MASTER_FLOW_OK' in image_status_text
+        if not image_ok:
+            try:
+                project_check=safe_name(str(SETTINGS.get('selected_project','') or ''))
+                if project_check:
+                    scenes=[s for s in load_manifest(project_check) if scene_media_type(s,'image') == 'image']
+                    verified=[]
+                    for scene in scenes:
+                        sid=str(scene.get('scene_id') or '').strip()
+                        fp=project_dir(project_check)/'Hình ảnh'/f'{sid}.png'
+                        if sid and fp.is_file() and fp.stat().st_size > 0: verified.append(sid)
+                    image_ok=bool(scenes) and len(verified)>=len(scenes)
+                    if image_ok:
+                        workflow_cmd_log('MASTER','FLOW_FINISH_GATE_RECOVERED_FROM_FILES',project=project_check,verified=len(verified),expected=len(scenes))
+            except Exception as exc:
+                workflow_cmd_log('MASTER','FLOW_FINISH_GATE_VERIFY_WARNING',error=str(exc)[:500],level='WARN')
+    else:
+        image_ok='MASTER_IMAGE_OK' in image_status_text or 'MASTER_ZIMAGE_OK' in image_status_text
+        if not image_ok:
+            try:
+                project_check=safe_name(str(SETTINGS.get('selected_project','') or ''))
+                if project_check:
+                    verify_ok,verify_files,verify_missing,verify_bad=_verify_zimage_project_images(project_check)
+                    expected_images=[s for s in load_manifest(project_check) if scene_media_type(s,'image') == 'image']
+                    image_ok=bool(verify_ok and len(verify_files)>=len(expected_images))
+                    if image_ok:
+                        workflow_cmd_log('MASTER','ZIMAGE_FINISH_GATE_RECOVERED_FROM_FILES',project=project_check,verified=len(verify_files),expected=len(expected_images))
+            except Exception as exc:
+                workflow_cmd_log('MASTER','ZIMAGE_FINISH_GATE_VERIFY_WARNING',error=str(exc)[:500],level='WARN')
     qc_ok=str(final_qc_text or '').strip().startswith('✓ FINAL QC PASS')
     clean_ok='CLEAN MAX VIP hoàn tất' in str(clean_status or '')
-    if not (zimage_ok and qc_ok and clean_ok):
+    if not (image_ok and qc_ok and clean_ok):
         with MASTER_STATE_LOCK: MASTER_RUNNING.clear()
         workflow_cmd_log('MASTER','FINISHED_INCOMPLETE',
-                             zimage_ok=zimage_ok, final_qc=qc_ok, clean_ok=clean_ok,
+                             image_ok=image_ok, engine=selected_engine, final_qc=qc_ok, clean_ok=clean_ok,
                              pct=0, level='ERROR',
-                             detail=f'Workflow chưa đủ điều kiện hoàn tất · Ảnh={zimage_ok} QC={qc_ok} Dọn={clean_ok}')
-        print(f"[{vietnam_now().strftime('%H:%M:%S')}] [WORKFLOW] Chưa hoàn tất · Ảnh={zimage_ok} QC={qc_ok} Dọn={clean_ok}",flush=True)
+                             detail=f'Workflow chưa đủ điều kiện hoàn tất · Engine={selected_engine} · Ảnh={image_ok} QC={qc_ok} Dọn={clean_ok}')
+        print(f"[{vietnam_now().strftime('%H:%M:%S')}] [WORKFLOW] Chưa hoàn tất · Engine={selected_engine} · Ảnh={image_ok} QC={qc_ok} Dọn={clean_ok}",flush=True)
         return gr.Button(value='⏺ OFF — Chưa hoàn tất',variant='secondary'),'⛔ MASTER CHƯA HOÀN TẤT — không archive, không xác nhận thành công.'
     project=safe_name(str(SETTINGS.get('selected_project','') or ''))
     workflow_cmd_log('MASTER','PROVENANCE_START',project=project,pct=97)
